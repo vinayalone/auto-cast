@@ -724,7 +724,6 @@ async def show_task_details(uid, m, tid):
     txt = (
         f"⚙️ **Task Details**\n\n"
         f"📂 **Type:** {type_str}\n"
-        f"📝 **Content:** `{(t['content_text'] or 'Media')[:60]}…`\n"
         f"📅 **Scheduled:** `{time_str}`\n"
         f"🔁 **Repeat:** `{t['repeat_interval'] or 'Once'}`\n"
         f"📌 **Pin:** {'✅' if t['pin'] else '❌'} | "
@@ -1572,6 +1571,9 @@ def _extract_file_id(m):
     if m.sticker:    return m.sticker.file_id
     return None
 
+
+# ── 1. In process_content_message — store the replied-to msg ID from the channel
+#       (user replies to a forwarded channel msg in bot chat to set a thread reply)
 async def process_content_message(c, m, uid):
     st = user_state[uid]
     st["content_type"] = m.media.value if m.media else "text"
@@ -1581,8 +1583,16 @@ async def process_content_message(c, m, uid):
     st["input_msg_id"] = m.id
     st["src_chat_id"]  = m.chat.id
     st["src_msg_id"]   = m.id
-    if m.reply_to_message:
-        st["reply_ref_id"] = m.reply_to_message.id
+    # Store the original channel message ID the user replied to (for thread reply)
+    if m.reply_to_message and m.reply_to_message.forward_from_chat:
+        st["reply_to_channel_msg_id"] = m.reply_to_message.forward_date and \
+            m.reply_to_message.id or None
+        # Prefer the actual forwarded message ID in the channel
+        st["reply_to_channel_msg_id"] = getattr(
+            m.reply_to_message, "forward_from_message_id", None
+        )
+    else:
+        st["reply_to_channel_msg_id"] = None
     await show_time_menu(m, uid)
 
 
@@ -1803,7 +1813,8 @@ async def create_task_logic(uid, q):
                 "repeat_interval":    interval,
                 "start_time":         run_time.isoformat(),
                 "last_msg_id":        None,
-                "reply_target":       reply_target,
+                # batch thread reply takes priority; fall back to direct channel msg reply
+                "reply_target":       reply_target or str(st.get("reply_to_channel_msg_id") or ""),
                 "src_chat_id":        post.get("src_chat_id", 0),
                 "src_msg_id":         post.get("src_msg_id", 0),
             }
@@ -1839,7 +1850,7 @@ def add_scheduler_job(t):
     if dt.tzinfo is None:
         dt = pytz.utc.localize(dt)
 
-    async def job_func():
+async def job_func():
         async with queue_lock:
             logger.info(f"🚀 Job {tid} triggered")
             fresh = await get_single_task(tid)
@@ -1912,10 +1923,20 @@ def add_scheduler_job(t):
                         except Exception as e:
                             logger.warning(f"Job {tid}: delete old failed: {e}")
 
+                    # ── FIX: resolve reply_id for both batch threading and direct channel msg reply
                     if fresh.get("reply_target"):
-                        ref = await get_single_task(fresh["reply_target"])
-                        if ref and ref.get("last_msg_id"):
-                            reply_id = ref["last_msg_id"]
+                        ref_val = fresh["reply_target"]
+                        if ref_val.startswith("task_"):
+                            # Batch thread reply — look up the sibling task's last sent msg
+                            ref = await get_single_task(ref_val)
+                            if ref and ref.get("last_msg_id"):
+                                reply_id = ref["last_msg_id"]
+                        else:
+                            # Direct channel message ID stored as a plain integer string
+                            try:
+                                reply_id = int(ref_val)
+                            except (ValueError, TypeError):
+                                reply_id = None
 
                     ct  = fresh["content_type"]
                     fid = fresh["file_id"]
@@ -1928,7 +1949,7 @@ def add_scheduler_job(t):
                                 entities=ents,
                                 parse_mode=None,
                                 reply_to_message_id=reply_id,
-                                disable_web_page_preview=False
+                                disable_web_page_preview=True,   # ── FIX: was False
                             )
                         elif ct == "poll":
                             pd = json.loads(caption)
@@ -2080,7 +2101,6 @@ def add_scheduler_job(t):
             DateTrigger(run_date=dt, timezone=pytz.utc),
             id=tid, replace_existing=True, misfire_grace_time=3600
         )
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
