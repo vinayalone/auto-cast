@@ -1041,7 +1041,7 @@ async def _handle_callback(c, q, uid, d):
         user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
         user_state[uid]["interval"]        = task["repeat_interval"]
         user_state[uid]["step"]            = "rescheduling"
-        await show_time_menu(q.message, uid, force_new=True)
+        await show_time_menu(q.message, uid, force_new=False)
 
     elif d.startswith("edit_settings_"):
         tid = d[14:]
