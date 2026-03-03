@@ -615,13 +615,13 @@ async def ask_settings(m, uid, force_new=False):
         [InlineKeyboardButton(f"🗑 Delete Previous: {del_icon}", callback_data="toggle_del")],
         [InlineKeyboardButton(off_text,                          callback_data="wizard_ask_offset")],
         [InlineKeyboardButton("➡️ Confirm",                     callback_data="goto_confirm")],
-        [InlineKeyboardButton("🔙 Back",                        callback_data="step_rep")],
+        [InlineKeyboardButton("🔙 Back",  callback_data=st.get("editing_task_id") and f'view_{st.get("editing_task_id")}' or "step_rep")],
     ]
     await update_menu(
         m,
         f"4️⃣ **Post Settings**\n\nConfigure how your post behaves.\n"
         f"Auto-delete: **{'OFF' if not offset else str(offset)+' minutes after posting'}**",
-        kb, uid, force_new
+        kb, uid, force_new=False
     )
 
 async def confirm_task(m, uid, force_new=False):
@@ -727,12 +727,13 @@ async def show_task_details(uid, m, tid):
         f"⏰ **Auto-Delete:** {str(t.get('auto_delete_offset') or 0)+'m' if t.get('auto_delete_offset') else 'OFF'}"
     )
     kb = [
-        [InlineKeyboardButton("👁 Preview Post",  callback_data=f"prev_{tid}"),
-         InlineKeyboardButton("✏️ Change Post",  callback_data=f"edit_content_{tid}")],
-        [InlineKeyboardButton("🗓 Reschedule",    callback_data=f"reschedule_{tid}"),
-         InlineKeyboardButton("⚙️ Settings",     callback_data=f"edit_settings_{tid}")],
-        [InlineKeyboardButton("🗑 Delete Task",   callback_data=f"del_task_{tid}")],
-        [InlineKeyboardButton("🔙 Back to List",  callback_data=f"back_list_{t['chat_id']}")],
+        [InlineKeyboardButton("👁 View Post",      callback_data=f"prev_{tid}"),
+         InlineKeyboardButton("✏️ Change Post",   callback_data=f"edit_content_{tid}")],
+        [InlineKeyboardButton("🗓 Reschedule",     callback_data=f"reschedule_{tid}"),
+         InlineKeyboardButton("🔁 Repetition",    callback_data=f"edit_repeat_{tid}")],
+        [InlineKeyboardButton("⚙️ Settings",      callback_data=f"edit_settings_{tid}")],
+        [InlineKeyboardButton("🗑 Delete Task",    callback_data=f"del_task_{tid}")],
+        [InlineKeyboardButton("🔙 Back to List",   callback_data=f"back_list_{t['chat_id']}")],
     ]
     await update_menu(m, txt, kb, uid)
 
@@ -959,37 +960,51 @@ async def _handle_callback(c, q, uid, d):
             await show_main_menu(q.message, uid)
 
     elif d.startswith("prev_"):
-        tid = d[5:]
+        tid  = d[5:]
         task = await get_single_task(tid)
         if not task:
-            await q.answer("❌ Task not found.", show_alert=True)
+            await q.answer("Task not found.", show_alert=True)
             return
-        # Try to show last sent message first, else show original source
-        previewed = False
-        if task.get("last_msg_id") and task.get("chat_id"):
-            try:
-                await app.copy_message(
-                    chat_id=uid,
-                    from_chat_id=int(task["chat_id"]),
-                    message_id=task["last_msg_id"]
-                )
-                await q.answer("✅ Last sent post forwarded to you!")
-                previewed = True
-            except Exception:
-                pass
-        if not previewed and task.get("src_chat_id") and task.get("src_msg_id"):
-            try:
-                await app.copy_message(
-                    chat_id=uid,
-                    from_chat_id=task["src_chat_id"],
-                    message_id=task["src_msg_id"]
-                )
-                await q.answer("✅ Original post forwarded to you!")
-                previewed = True
-            except Exception:
-                pass
-        if not previewed:
-            await q.answer("❌ Cannot preview — post not yet sent and original unavailable.", show_alert=True)
+        type_map = {
+            "text": "Text", "photo": "Photo", "video": "Video",
+            "audio": "Audio", "poll": "Poll", "sticker": "Sticker",
+            "voice": "Voice", "document": "File", "animation": "GIF"
+        }
+        ct  = task["content_type"]
+        tz  = await get_user_tz(uid)
+        try:
+            dt = datetime.datetime.fromisoformat(task["start_time"])
+            if dt.tzinfo is None:
+                dt = pytz.utc.localize(dt)
+            time_str = dt.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
+        except Exception:
+            time_str = "?"
+        back_kb = [[InlineKeyboardButton("Back to Task", callback_data=f"view_{tid}")]]
+        if ct == "text":
+            body    = task["content_text"] or "(empty)"
+            rep_str = task["repeat_interval"] or "Once"
+            preview = "Post Content\n" + ("-"*20) + "\n" + body + "\n" + ("-"*20) + "\nScheduled: " + time_str + "  |  Repeat: " + rep_str
+            await update_menu(q.message, preview, back_kb, uid)
+        else:
+            type_label = type_map.get(ct, ct.upper())
+            rep_str2   = task["repeat_interval"] or "Once"
+            summary    = "Post Preview - " + type_label + "\n\nScheduled: " + time_str + "\nRepeat: " + rep_str2 + "\n\nMedia sent below (you can copy it)"
+            await update_menu(q.message, summary, back_kb, uid)
+            sent_media = False
+            for src_chat, src_msg in [
+                (task.get("src_chat_id"), task.get("src_msg_id")),
+                (int(task["chat_id"]) if task.get("last_msg_id") else None, task.get("last_msg_id")),
+            ]:
+                if src_chat and src_msg:
+                    try:
+                        await app.copy_message(uid, from_chat_id=src_chat, message_id=src_msg)
+                        sent_media = True
+                        break
+                    except Exception:
+                        pass
+            if not sent_media:
+                cap = task.get("content_text") or ""
+                await app.send_message(uid, "Cannot retrieve media." + ("\n\nCaption: " + cap[:300] if cap else ""))
 
     elif d.startswith("edit_content_"):
         tid = d[13:]
@@ -1043,7 +1058,6 @@ async def _handle_callback(c, q, uid, d):
         user_state[uid]["del"]             = task["delete_old"]
         user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
         user_state[uid]["interval"]        = task["repeat_interval"]
-        # Reconstruct start_time
         try:
             dt = datetime.datetime.fromisoformat(task["start_time"])
             if dt.tzinfo is None:
@@ -1051,7 +1065,42 @@ async def _handle_callback(c, q, uid, d):
             user_state[uid]["start_time"] = dt
         except Exception:
             pass
-        await ask_settings(q.message, uid, force_new=True)
+        await ask_settings(q.message, uid)
+
+    elif d.startswith("edit_repeat_"):
+        tid = d[12:]
+        task = await get_single_task(tid)
+        if not task:
+            await q.answer("❌ Task not found.", show_alert=True)
+            return
+        # Load task into state so rep_ handler can save it
+        user_state[uid]["editing_task_id"] = tid
+        user_state[uid]["content_type"]    = task["content_type"]
+        user_state[uid]["content_text"]    = task["content_text"]
+        user_state[uid]["file_id"]         = task["file_id"]
+        user_state[uid]["entities"]        = task["entities"]
+        user_state[uid]["pin"]             = task["pin"]
+        user_state[uid]["del"]             = task["delete_old"]
+        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
+        user_state[uid]["interval"]        = task["repeat_interval"]
+        try:
+            dt = datetime.datetime.fromisoformat(task["start_time"])
+            if dt.tzinfo is None:
+                dt = pytz.utc.localize(dt)
+            user_state[uid]["start_time"] = dt
+        except Exception:
+            pass
+        # Show repetition menu — back goes to task details
+        kb = [
+            [InlineKeyboardButton("🔂 Once (No Repeat)",   callback_data="rep_0")],
+            [InlineKeyboardButton("Every 1 Hour",          callback_data="rep_60"),
+             InlineKeyboardButton("Every 3 Hours",         callback_data="rep_180")],
+            [InlineKeyboardButton("Every 6 Hours",         callback_data="rep_360"),
+             InlineKeyboardButton("Every 12 Hours",        callback_data="rep_720")],
+            [InlineKeyboardButton("Every 24 Hours",        callback_data="rep_1440")],
+            [InlineKeyboardButton("🔙 Back",               callback_data=f"view_{tid}")],
+        ]
+        await update_menu(q.message, "🔁 **Change Repetition**\n\nHow often should this task repeat?", kb, uid)
 
     # ── BROADCAST ─────────────────────────────────────────────────────────────
     elif d == "broadcast_start":
@@ -1183,7 +1232,12 @@ async def _handle_callback(c, q, uid, d):
     elif d.startswith("rep_"):
         val = d[4:]
         user_state[uid]["interval"] = f"minutes={val}" if val != "0" else None
-        await ask_settings(q.message, uid)
+        # If editing an existing task, save immediately and go back to task details
+        editing_tid = user_state[uid].get("editing_task_id")
+        if editing_tid:
+            await update_task_logic(uid, q)
+        else:
+            await ask_settings(q.message, uid)
 
     # ── SETTINGS TOGGLES ─────────────────────────────────────────────────────
     elif d == "toggle_pin":
@@ -1685,14 +1739,9 @@ async def update_task_logic(uid, q):
         user_state[uid].pop(key, None)
 
     t_str = start_time.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
-    await update_menu(
-        q.message,
-        f"✅ **Task Updated!**\n\n"
-        f"📅 **New Time:** `{t_str}`\n"
-        f"🔁 **Repeat:** `{updated['repeat_interval'] or 'Once'}`\n\n"
-        f"Use /manage to view your tasks.",
-        None, uid, force_new=False
-    )
+    await q.answer("✅ Task updated!")
+    # Go back to the task details screen
+    await show_task_details(uid, q.message, tid)
 
 async def create_task_logic(uid, q):
     st      = user_state[uid]
@@ -1870,8 +1919,11 @@ def add_scheduler_job(t):
                         nonlocal sent
                         if ct == "text":
                             sent = await user.send_message(
-                                target_int, caption, entities=ents,
-                                reply_to_message_id=reply_id
+                                target_int, caption or " ",
+                                entities=ents,
+                                parse_mode=None,
+                                reply_to_message_id=reply_id,
+                                disable_web_page_preview=False
                             )
                         elif ct == "poll":
                             pd = json.loads(caption)
