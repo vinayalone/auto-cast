@@ -17,14 +17,12 @@ from pyrogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 
-# ── Logging setup first so check_env_vars can log ───────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 logger = logging.getLogger("AutoCast")
 
-# ── FIX B1: Safe env loading — int(None) no longer crashes at import ─────────
 def _require_env(key: str) -> str:
     val = os.environ.get(key)
     if not val:
@@ -39,15 +37,13 @@ def check_env_vars():
         logger.error(f"❌ Missing env vars: {', '.join(missing)}")
         sys.exit(1)
 
-API_ID    = int(os.environ.get("API_ID", "0") or "0")
-API_HASH  = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+API_ID       = int(os.environ.get("API_ID", "0") or "0")
+API_HASH     = os.environ.get("API_HASH", "")
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-# ── Default fallback timezone (UTC for global users) ─────────────────────────
 DEFAULT_TZ = pytz.utc
 
-# ── Init ─────────────────────────────────────────────────────────────────────
 app = Client(
     "autocast_v2",
     api_id=API_ID,
@@ -58,9 +54,9 @@ scheduler  = None
 db_pool    = None
 queue_lock = None
 
-login_state = {}   # uid → login flow state
-user_state  = {}   # uid → wizard state
-tz_cache    = {}   # uid → pytz timezone object (in-memory cache)
+login_state = {}
+user_state  = {}
+tz_cache    = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TIMEZONE HELPERS
@@ -122,10 +118,9 @@ async def get_db():
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
-        # ── FIX B2: Create ALL tables, not just tasks ─────────────────────
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS userbot_sessions (
-                user_id       BIGINT PRIMARY KEY,
+                user_id        BIGINT PRIMARY KEY,
                 session_string TEXT NOT NULL
             );
         """)
@@ -146,25 +141,24 @@ async def init_db():
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS userbot_tasks_v11 (
-                task_id           TEXT PRIMARY KEY,
-                owner_id          BIGINT,
-                chat_id           TEXT,
-                content_type      TEXT,
-                content_text      TEXT,
-                file_id           TEXT,
-                entities          TEXT,
-                pin               BOOLEAN DEFAULT FALSE,
-                delete_old        BOOLEAN DEFAULT FALSE,
-                repeat_interval   TEXT,
-                start_time        TEXT,
-                last_msg_id       BIGINT,
+                task_id            TEXT PRIMARY KEY,
+                owner_id           BIGINT,
+                chat_id            TEXT,
+                content_type       TEXT,
+                content_text       TEXT,
+                file_id            TEXT,
+                entities           TEXT,
+                pin                BOOLEAN DEFAULT FALSE,
+                delete_old         BOOLEAN DEFAULT FALSE,
+                repeat_interval    TEXT,
+                start_time         TEXT,
+                last_msg_id        BIGINT,
                 auto_delete_offset INTEGER DEFAULT 0,
-                reply_target      TEXT,
-                src_chat_id       BIGINT DEFAULT 0,
-                src_msg_id        BIGINT DEFAULT 0
+                reply_target       TEXT,
+                src_chat_id        BIGINT DEFAULT 0,
+                src_msg_id         BIGINT DEFAULT 0
             );
         """)
-        # Safe column migrations for existing deployments
         for sql in [
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
@@ -238,20 +232,7 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     return row["access_hash"] if row and row["access_hash"] else 0
 
 async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) -> int:
-    """
-    Iterate the user's dialogs using Pyrogram's high-level get_dialogs().
-    Pyrogram automatically caches every peer it sees in each page of results.
-    Once the target channel appears, resolve_peer() will work and we extract
-    the correct user-account-specific access_hash and save it to the DB.
-
-    This is the only reliable approach for :memory: clients because:
-    - The session_string restores auth credentials only — no peer cache.
-    - access_hash is per-account: the bot's hash is useless for the userbot.
-    - channels.GetChannels with hash=0 is rejected by Telegram.
-    - get_dialogs() works without any pre-cached peer (uses InputPeerEmpty first).
-    """
     try:
-        # Pyrogram's get_dialogs paginates automatically and caches all peers
         async for dialog in user_client.get_dialogs():
             if dialog.chat.id == channel_id:
                 try:
@@ -274,12 +255,6 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) ->
     return 0
 
 def inject_peer(storage, peer_id: int, access_hash: int):
-    """
-    Write a channel peer directly into the client's in-memory SQLite cache.
-    Pyrogram's :memory: clients start with an empty peer table, so resolve_peer
-    always fails. Inserting the row ourselves makes every subsequent high-level
-    API call work normally with the plain integer chat_id.
-    """
     try:
         storage.conn.execute(
             "INSERT OR REPLACE INTO peers "
@@ -553,17 +528,15 @@ async def show_channel_options(uid, m, cid, force_new=False):
 async def show_time_menu(m, uid, force_new=False):
     st = user_state.get(uid, {})
     editing_tid = st.get("editing_task_id")
-    # If we're rescheduling, "Back" should return to task details, not home
     back_target = f"view_{editing_tid}" if editing_tid else "menu_home"
-
     kb = [
-        [InlineKeyboardButton("⚡️ Now (5s delay)",   callback_data="time_0")],
-        [InlineKeyboardButton("5 Minutes",            callback_data="time_5"),
-         InlineKeyboardButton("15 Minutes",           callback_data="time_15")],
-        [InlineKeyboardButton("30 Minutes",           callback_data="time_30"),
-         InlineKeyboardButton("1 Hour",               callback_data="time_60")],
-        [InlineKeyboardButton("📅 Custom Date/Time",  callback_data="time_custom")],
-        [InlineKeyboardButton("🔙 Back",              callback_data=back_target)],
+        [InlineKeyboardButton("⚡️ Now (5s delay)",  callback_data="time_0")],
+        [InlineKeyboardButton("5 Minutes",           callback_data="time_5"),
+         InlineKeyboardButton("15 Minutes",          callback_data="time_15")],
+        [InlineKeyboardButton("30 Minutes",          callback_data="time_30"),
+         InlineKeyboardButton("1 Hour",              callback_data="time_60")],
+        [InlineKeyboardButton("📅 Custom Date/Time", callback_data="time_custom")],
+        [InlineKeyboardButton("🔙 Back",             callback_data=back_target)],
     ]
     tz = await get_user_tz(uid)
     await update_menu(
@@ -574,13 +547,13 @@ async def show_time_menu(m, uid, force_new=False):
 
 async def ask_repetition(m, uid, force_new=False):
     kb = [
-        [InlineKeyboardButton("🔂 Once (No Repeat)",   callback_data="rep_0")],
-        [InlineKeyboardButton("Every 1 Hour",          callback_data="rep_60"),
-         InlineKeyboardButton("Every 3 Hours",         callback_data="rep_180")],
-        [InlineKeyboardButton("Every 6 Hours",         callback_data="rep_360"),
-         InlineKeyboardButton("Every 12 Hours",        callback_data="rep_720")],
-        [InlineKeyboardButton("Every 24 Hours",        callback_data="rep_1440")],
-        [InlineKeyboardButton("🔙 Back",               callback_data="step_time")],
+        [InlineKeyboardButton("🔂 Once (No Repeat)",  callback_data="rep_0")],
+        [InlineKeyboardButton("Every 1 Hour",         callback_data="rep_60"),
+         InlineKeyboardButton("Every 3 Hours",        callback_data="rep_180")],
+        [InlineKeyboardButton("Every 6 Hours",        callback_data="rep_360"),
+         InlineKeyboardButton("Every 12 Hours",       callback_data="rep_720")],
+        [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
+        [InlineKeyboardButton("🔙 Back",              callback_data="step_time")],
     ]
     await update_menu(m, "3️⃣ **Repetition**\n\nHow often should this post repeat?", kb, uid, force_new)
 
@@ -596,8 +569,8 @@ async def ask_settings(m, uid, force_new=False):
         )
         kb = []
         for i, post in enumerate(queue):
-            p  = "✅" if post.get("pin")        else "❌"
-            d  = "✅" if post.get("delete_old") else "❌"
+            p   = "✅" if post.get("pin")        else "❌"
+            d   = "✅" if post.get("delete_old") else "❌"
             off = post.get("auto_delete_offset", 0)
             off_s = f"{off}m" if off > 0 else "OFF"
             kb.append([InlineKeyboardButton(
@@ -616,11 +589,12 @@ async def ask_settings(m, uid, force_new=False):
     del_icon = "✅" if st["del"] else "❌"
     off_text = f"⏰ Auto-Delete: {offset}m after posting" if offset > 0 else "⏰ Auto-Delete: OFF"
     kb = [
-        [InlineKeyboardButton(f"📌 Pin Message: {pin_icon}",    callback_data="toggle_pin")],
+        [InlineKeyboardButton(f"📌 Pin Message: {pin_icon}",     callback_data="toggle_pin")],
         [InlineKeyboardButton(f"🗑 Delete Previous: {del_icon}", callback_data="toggle_del")],
-        [InlineKeyboardButton(off_text,                          callback_data="wizard_ask_offset")],
-        [InlineKeyboardButton("➡️ Confirm",                     callback_data="goto_confirm")],
-        [InlineKeyboardButton("🔙 Back",  callback_data=st.get("editing_task_id") and f'view_{st.get("editing_task_id")}' or "step_rep")],
+        [InlineKeyboardButton(off_text,                           callback_data="wizard_ask_offset")],
+        [InlineKeyboardButton("➡️ Confirm",                      callback_data="goto_confirm")],
+        [InlineKeyboardButton("🔙 Back",
+            callback_data=st.get("editing_task_id") and f'view_{st.get("editing_task_id")}' or "step_rep")],
     ]
     await update_menu(
         m,
@@ -632,15 +606,14 @@ async def ask_settings(m, uid, force_new=False):
 async def confirm_task(m, uid, force_new=False):
     st = user_state[uid]
     tz = await get_user_tz(uid)
-    t_str = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
-    # FIX B10: use .get() to avoid KeyError
+    t_str    = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
     interval = st.get("interval")
-    r_str = interval if interval else "Once"
-    queue = st.get("broadcast_queue")
+    r_str    = interval if interval else "Once"
+    queue    = st.get("broadcast_queue")
 
     if queue:
-        type_str   = f"📦 Batch ({len(queue)} Posts)"
-        pin_count  = sum(1 for p in queue if p.get("pin"))
+        type_str     = f"📦 Batch ({len(queue)} Posts)"
+        pin_count    = sum(1 for p in queue if p.get("pin"))
         settings_str = f"📌 Pinning: {pin_count}/{len(queue)} Posts"
     else:
         type_map = {
@@ -648,8 +621,8 @@ async def confirm_task(m, uid, force_new=False):
             "audio": "🎵 Audio", "voice": "🎙 Voice", "document": "📁 File",
             "poll": "📊 Poll", "animation": "🎞 GIF", "sticker": "✨ Sticker"
         }
-        c_type     = st.get("content_type", "unknown")
-        type_str   = type_map.get(c_type, c_type.upper())
+        c_type       = st.get("content_type", "unknown")
+        type_str     = type_map.get(c_type, c_type.upper())
         settings_str = (
             f"📌 Pin: {'✅' if st.get('pin', True) else '❌'} | "
             f"🗑 Del Old: {'✅' if st.get('del', True) else '❌'}"
@@ -678,8 +651,8 @@ async def list_active_tasks(uid, m, cid, force_new=False):
         )
         return
     tasks.sort(key=lambda x: x["start_time"])
-    tz       = await get_user_tz(uid)
-    icons    = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
+    tz    = await get_user_tz(uid)
+    icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
     kb = []
     for t in tasks:
         snippet = (t["content_text"] or "Media")[:15] + "…"
@@ -728,19 +701,19 @@ async def show_task_details(uid, m, tid):
         f"🔁 **Repeat:** `{t['repeat_interval'] or 'Once'}`\n"
         f"📌 **Pin:** {'✅' if t['pin'] else '❌'} | "
         f"🗑 **Del Old:** {'✅' if t['delete_old'] else '❌'} | "
-        f"⏰ **Auto-Delete:** {str(t.get('auto_delete_offset') or 0)+'m' if t.get('auto_delete_offset') else 'OFF'}"
+        f"⏰ **Auto-Delete:** "
+        f"{str(t.get('auto_delete_offset') or 0)+'m' if t.get('auto_delete_offset') else 'OFF'}"
     )
     kb = [
-        [InlineKeyboardButton("👁 View Post",      callback_data=f"prev_{tid}"),
-         InlineKeyboardButton("✏️ Change Post",   callback_data=f"edit_content_{tid}")],
-        [InlineKeyboardButton("🗓 Reschedule",     callback_data=f"reschedule_{tid}"),
-         InlineKeyboardButton("🔁 Repetition",    callback_data=f"edit_repeat_{tid}")],
-        [InlineKeyboardButton("⚙️ Settings",      callback_data=f"edit_settings_{tid}")],
-        [InlineKeyboardButton("🗑 Delete Task",    callback_data=f"del_task_{tid}")],
-        [InlineKeyboardButton("🔙 Back to List",   callback_data=f"back_list_{t['chat_id']}")],
+        [InlineKeyboardButton("👁 View Post",     callback_data=f"prev_{tid}"),
+         InlineKeyboardButton("✏️ Change Post",  callback_data=f"edit_content_{tid}")],
+        [InlineKeyboardButton("🗓 Reschedule",    callback_data=f"reschedule_{tid}"),
+         InlineKeyboardButton("🔁 Repetition",   callback_data=f"edit_repeat_{tid}")],
+        [InlineKeyboardButton("⚙️ Settings",     callback_data=f"edit_settings_{tid}")],
+        [InlineKeyboardButton("🗑 Delete Task",   callback_data=f"del_task_{tid}")],
+        [InlineKeyboardButton("🔙 Back to List",  callback_data=f"back_list_{t['chat_id']}")],
     ]
     await update_menu(m, txt, kb, uid)
-
 
 async def show_broadcast_selection(uid, m):
     chs = await get_channels(uid)
@@ -862,26 +835,23 @@ async def callback_router(c, q):
             pass
 
 async def _handle_callback(c, q, uid, d):
-    # ── HOME ──────────────────────────────────────────────────────────────────
     if d == "menu_home":
         user_state[uid]["step"] = None
         await show_main_menu(q.message, uid)
 
-    # ── TIMEZONE ─────────────────────────────────────────────────────────────
     elif d == "tz_select":
         await show_tz_selector(uid, q.message)
 
     elif d.startswith("set_tz_"):
         tz_str = d[len("set_tz_"):]
         try:
-            pytz.timezone(tz_str)   # validate
+            pytz.timezone(tz_str)
             await set_user_tz(uid, tz_str)
             await q.answer(f"✅ Timezone set to {tz_str}!", show_alert=False)
         except Exception:
             await q.answer("❌ Invalid timezone.", show_alert=True)
         await show_main_menu(q.message, uid)
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────────
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
         await update_menu(
@@ -893,7 +863,6 @@ async def _handle_callback(c, q, uid, d):
             uid
         )
 
-    # ── LOGOUT ────────────────────────────────────────────────────────────────
     elif d == "logout":
         pool = await get_db()
         count = await pool.fetchval(
@@ -943,7 +912,6 @@ async def _handle_callback(c, q, uid, d):
         except Exception:
             pass
 
-    # ── TASK VIEW / DELETE ────────────────────────────────────────────────────
     elif d.startswith("view_"):
         await show_task_details(uid, q.message, d[5:])
 
@@ -952,7 +920,6 @@ async def _handle_callback(c, q, uid, d):
 
     elif d.startswith("del_task_"):
         tid = d[9:]
-        # FIX B8: wrap remove_job separately so JobLookupError doesn't show error to user
         if scheduler:
             try: scheduler.remove_job(tid)
             except Exception: pass
@@ -987,12 +954,20 @@ async def _handle_callback(c, q, uid, d):
         if ct == "text":
             body    = task["content_text"] or "(empty)"
             rep_str = task["repeat_interval"] or "Once"
-            preview = "Post Content\n" + ("-"*20) + "\n" + body + "\n" + ("-"*20) + "\nScheduled: " + time_str + "  |  Repeat: " + rep_str
+            preview = (
+                "Post Content\n" + ("-"*20) + "\n" + body + "\n" + ("-"*20) +
+                "\nScheduled: " + time_str + "  |  Repeat: " + rep_str
+            )
             await update_menu(q.message, preview, back_kb, uid)
         else:
             type_label = type_map.get(ct, ct.upper())
             rep_str2   = task["repeat_interval"] or "Once"
-            summary    = "Post Preview - " + type_label + "\n\nScheduled: " + time_str + "\nRepeat: " + rep_str2 + "\n\nMedia sent below (you can copy it)"
+            summary    = (
+                "Post Preview - " + type_label +
+                "\n\nScheduled: " + time_str +
+                "\nRepeat: " + rep_str2 +
+                "\n\nMedia sent below (you can copy it)"
+            )
             await update_menu(q.message, summary, back_kb, uid)
             sent_media = False
             for src_chat, src_msg in [
@@ -1008,7 +983,10 @@ async def _handle_callback(c, q, uid, d):
                         pass
             if not sent_media:
                 cap = task.get("content_text") or ""
-                await app.send_message(uid, "Cannot retrieve media." + ("\n\nCaption: " + cap[:300] if cap else ""))
+                await app.send_message(
+                    uid,
+                    "Cannot retrieve media." + ("\n\nCaption: " + cap[:300] if cap else "")
+                )
 
     elif d.startswith("edit_content_"):
         tid = d[13:]
@@ -1034,7 +1012,6 @@ async def _handle_callback(c, q, uid, d):
         if not task:
             await q.answer("❌ Task not found.", show_alert=True)
             return
-        # Preload existing task into state for re-use
         user_state[uid]["editing_task_id"] = tid
         user_state[uid]["content_type"]    = task["content_type"]
         user_state[uid]["content_text"]    = task["content_text"]
@@ -1077,7 +1054,6 @@ async def _handle_callback(c, q, uid, d):
         if not task:
             await q.answer("❌ Task not found.", show_alert=True)
             return
-        # Load task into state so rep_ handler can save it
         user_state[uid]["editing_task_id"] = tid
         user_state[uid]["content_type"]    = task["content_type"]
         user_state[uid]["content_text"]    = task["content_text"]
@@ -1094,19 +1070,21 @@ async def _handle_callback(c, q, uid, d):
             user_state[uid]["start_time"] = dt
         except Exception:
             pass
-        # Show repetition menu — back goes to task details
         kb = [
-            [InlineKeyboardButton("🔂 Once (No Repeat)",   callback_data="rep_0")],
-            [InlineKeyboardButton("Every 1 Hour",          callback_data="rep_60"),
-             InlineKeyboardButton("Every 3 Hours",         callback_data="rep_180")],
-            [InlineKeyboardButton("Every 6 Hours",         callback_data="rep_360"),
-             InlineKeyboardButton("Every 12 Hours",        callback_data="rep_720")],
-            [InlineKeyboardButton("Every 24 Hours",        callback_data="rep_1440")],
-            [InlineKeyboardButton("🔙 Back",               callback_data=f"view_{tid}")],
+            [InlineKeyboardButton("🔂 Once (No Repeat)",  callback_data="rep_0")],
+            [InlineKeyboardButton("Every 1 Hour",         callback_data="rep_60"),
+             InlineKeyboardButton("Every 3 Hours",        callback_data="rep_180")],
+            [InlineKeyboardButton("Every 6 Hours",        callback_data="rep_360"),
+             InlineKeyboardButton("Every 12 Hours",       callback_data="rep_720")],
+            [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
+             InlineKeyboardButton("Every 2 Days",       callback_data="rep_2880")],
+            [InlineKeyboardButton("Every 1 Week",       callback_data="rep_10080")],
+            [InlineKeyboardButton("🔙 Back",              callback_data=f"view_{tid}")],
         ]
-        await update_menu(q.message, "🔁 **Change Repetition**\n\nHow often should this task repeat?", kb, uid)
+        await update_menu(
+            q.message, "🔁 **Change Repetition**\n\nHow often should this task repeat?", kb, uid
+        )
 
-    # ── BROADCAST ─────────────────────────────────────────────────────────────
     elif d == "broadcast_start":
         user_state[uid]["step"] = "broadcast_select_channels"
         user_state[uid]["broadcast_targets"] = []
@@ -1143,7 +1121,6 @@ async def _handle_callback(c, q, uid, d):
             reply_markup=markup
         )
 
-    # ── CHANNEL MANAGEMENT ────────────────────────────────────────────────────
     elif d == "list_channels":
         await show_channels(uid, q.message)
 
@@ -1194,12 +1171,10 @@ async def _handle_callback(c, q, uid, d):
     elif d.startswith("tasks_"):
         await list_active_tasks(uid, q.message, d[6:])
 
-    # ── WIZARD NAVIGATION ─────────────────────────────────────────────────────
     elif d == "step_time":     await show_time_menu(q.message, uid)
     elif d == "step_rep":      await ask_repetition(q.message, uid)
     elif d == "step_settings": await ask_settings(q.message, uid)
 
-    # ── TIME SELECTION ────────────────────────────────────────────────────────
     elif d.startswith("time_"):
         offset_str = d[5:]
         tz = await get_user_tz(uid)
@@ -1226,24 +1201,20 @@ async def _handle_callback(c, q, uid, d):
                 second=0, microsecond=0
             )
         user_state[uid]["start_time"] = run_time
-        # If rescheduling an existing task, skip to confirm directly
         if user_state[uid].get("step") == "rescheduling":
             await confirm_task(q.message, uid)
         else:
             await ask_repetition(q.message, uid)
 
-    # ── REPETITION ────────────────────────────────────────────────────────────
     elif d.startswith("rep_"):
         val = d[4:]
         user_state[uid]["interval"] = f"minutes={val}" if val != "0" else None
-        # If editing an existing task, save immediately and go back to task details
         editing_tid = user_state[uid].get("editing_task_id")
         if editing_tid:
             await update_task_logic(uid, q)
         else:
             await ask_settings(q.message, uid)
 
-    # ── SETTINGS TOGGLES ─────────────────────────────────────────────────────
     elif d == "toggle_pin":
         st = user_state[uid]; st.setdefault("pin", True)
         st["pin"] = not st["pin"]
@@ -1254,11 +1225,10 @@ async def _handle_callback(c, q, uid, d):
         st["del"] = not st["del"]
         await ask_settings(q.message, uid)
 
-    # ── AUTO-DELETE OFFSET ────────────────────────────────────────────────────
     elif d.startswith("wizard_ask_offset"):
-        parts = d.split("_")
+        parts   = d.split("_")
         temp_id = f"WIZARD_{parts[3]}" if len(parts) > 3 else "WIZARD"
-        markup = await get_delete_before_kb(temp_id)
+        markup  = await get_delete_before_kb(temp_id)
         await update_menu(
             q.message,
             "⏳ **Auto-Delete Timing**\n\n"
@@ -1268,16 +1238,15 @@ async def _handle_callback(c, q, uid, d):
 
     elif d.startswith("set_del_off_WIZARD"):
         parts = d.split("_")
-        if len(parts) == 5:                      # single post
+        if len(parts) == 5:
             user_state[uid]["auto_delete_offset"] = int(parts[4])
             await q.answer(f"✅ Set to {parts[4]}m" if int(parts[4]) > 0 else "✅ Disabled")
-        elif len(parts) == 6:                    # batch post
+        elif len(parts) == 6:
             idx = int(parts[4]); offset = int(parts[5])
             user_state[uid]["broadcast_queue"][idx]["auto_delete_offset"] = offset
             await q.answer(f"✅ Post #{idx+1}: {offset}m" if offset > 0 else "✅ Disabled")
         await ask_settings(q.message, uid)
 
-    # ── BATCH POST INDIVIDUAL CONFIG ──────────────────────────────────────────
     elif d.startswith("cfg_q_"):
         idx  = int(d[6:])
         post = user_state[uid]["broadcast_queue"][idx]
@@ -1295,8 +1264,7 @@ async def _handle_callback(c, q, uid, d):
         ]
         await update_menu(
             q.message,
-            f"⚙️ **Post #{idx+1} Settings**\n\n"
-            f"Type: **{post['content_type']}**",
+            f"⚙️ **Post #{idx+1} Settings**\n\nType: **{post['content_type']}**",
             kb, uid
         )
 
@@ -1306,10 +1274,8 @@ async def _handle_callback(c, q, uid, d):
         post   = user_state[uid]["broadcast_queue"][idx]
         if action == "pin": post["pin"]        = not post.get("pin", True)
         if action == "del": post["delete_old"] = not post.get("delete_old", True)
-        q.data = f"cfg_q_{idx}"
         await _handle_callback(c, q, uid, f"cfg_q_{idx}")
 
-    # ── CONFIRM & SAVE ────────────────────────────────────────────────────────
     elif d == "goto_confirm":
         await confirm_task(q.message, uid)
 
@@ -1328,20 +1294,15 @@ async def _handle_callback(c, q, uid, d):
 @app.on_message(filters.private & ~filters.command(["start", "manage"]))
 async def handle_inputs(c, m):
     uid  = m.from_user.id
-    # Safe text — never None
     text = (m.text or m.caption or "").strip()
 
-    # ── LOGIN FLOW ────────────────────────────────────────────────────────────
     if uid in login_state:
         await _handle_login(c, m, uid, text)
         return
 
-    # ── FIX B5: Check keyboard buttons BEFORE checking step ──────────────────
     if text == "✅ Done Adding Posts":
-        # FIX B6: go to time menu, not confirm_task (start_time not set yet)
         if uid not in user_state:
             user_state[uid] = {}
-        # Remove reply keyboard and ask for schedule time
         await m.reply("✅ All posts added!", reply_markup=ReplyKeyboardRemove())
         await show_time_menu(m, uid, force_new=True)
         return
@@ -1352,22 +1313,17 @@ async def handle_inputs(c, m):
         await start_cmd(c, m)
         return
 
-    # ── STEP-BASED HANDLERS ───────────────────────────────────────────────────
     st   = user_state.get(uid, {})
     step = st.get("step")
 
     if step == "waiting_content":
         await process_content_message(c, m, uid)
-
     elif step == "waiting_content_edit":
         await process_content_edit_message(c, m, uid)
-
     elif step == "waiting_broadcast_content":
         await process_broadcast_content_message(c, m, uid)
-
     elif step == "waiting_custom_date":
         await process_custom_date(c, m, uid)
-
     elif step == "waiting_forward":
         if m.forward_from_chat:
             await handle_forward_add(c, m, uid)
@@ -1378,16 +1334,11 @@ async def handle_inputs(c, m):
                     InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")
                 ]])
             )
-
     elif step == "waiting_channel_id":
         await handle_channel_id_input(c, m, uid, text)
-
     else:
-        # FIX B9: use `text` (safe), not `m.text` (may be None)
         if text and not text.startswith("/"):
-            await m.reply(
-                "Use the menu to interact with the bot. Type /start to open it."
-            )
+            await m.reply("Use the menu to interact with the bot. Type /start to open it.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGIN FLOW
@@ -1420,7 +1371,9 @@ async def _handle_login(c, m, uid, text):
             )
         except Exception as e:
             await wait.delete()
-            await m.reply(f"❌ **Connection failed:** {e}\n\nCheck your phone number and try /start again.")
+            await m.reply(
+                f"❌ **Connection failed:** {e}\n\nCheck your phone number and try /start again."
+            )
 
     elif st["step"] == "waiting_code":
         try:
@@ -1482,14 +1435,10 @@ async def handle_forward_add(c, m, uid):
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user_client:
-            # warm_peer iterates the user's own dialogs — this gives us the
-            # user-account-specific access_hash, which is the only one that works
             access_hash = await warm_peer_and_get_hash(user_client, uid, cid)
-            # Also try to get a better title if dialogs returned the chat
             try:
                 peer = await user_client.storage.get_peer_by_id(cid)
-                # peer found — get_chat will work now (peer is cached)
-                chat = await user_client.get_chat(cid)
+                chat  = await user_client.get_chat(cid)
                 title = chat.title or title
             except Exception:
                 pass
@@ -1529,7 +1478,6 @@ async def handle_channel_id_input(c, m, uid, text):
             session_string=session,
             device_model="AutoCast", system_version="Railway", app_version="2.0"
         ) as user_client:
-            # Warm peer cache by iterating dialogs — gives user-specific access_hash
             access_hash = await warm_peer_and_get_hash(user_client, uid, channel_id)
             if not access_hash:
                 await m.reply(
@@ -1537,7 +1485,6 @@ async def handle_channel_id_input(c, m, uid, text):
                     "Make sure you are a **member or admin** of this channel and try again."
                 )
                 return
-            # Now peer is cached — get_chat works
             try:
                 chat = await user_client.get_chat(channel_id)
                 if chat.type not in (enums.ChatType.CHANNEL, enums.ChatType.SUPERGROUP):
@@ -1562,18 +1509,15 @@ async def handle_channel_id_input(c, m, uid, text):
 #  CONTENT CAPTURE
 # ─────────────────────────────────────────────────────────────────────────────
 def _extract_file_id(m):
-    if m.photo:      return m.photo.file_id
-    if m.video:      return m.video.file_id
-    if m.audio:      return m.audio.file_id
-    if m.voice:      return m.voice.file_id
-    if m.document:   return m.document.file_id
-    if m.animation:  return m.animation.file_id
-    if m.sticker:    return m.sticker.file_id
+    if m.photo:     return m.photo.file_id
+    if m.video:     return m.video.file_id
+    if m.audio:     return m.audio.file_id
+    if m.voice:     return m.voice.file_id
+    if m.document:  return m.document.file_id
+    if m.animation: return m.animation.file_id
+    if m.sticker:   return m.sticker.file_id
     return None
 
-
-# ── 1. In process_content_message — store the replied-to msg ID from the channel
-#       (user replies to a forwarded channel msg in bot chat to set a thread reply)
 async def process_content_message(c, m, uid):
     st = user_state[uid]
     st["content_type"] = m.media.value if m.media else "text"
@@ -1585,16 +1529,12 @@ async def process_content_message(c, m, uid):
     st["src_msg_id"]   = m.id
     # Store the original channel message ID the user replied to (for thread reply)
     if m.reply_to_message and m.reply_to_message.forward_from_chat:
-        st["reply_to_channel_msg_id"] = m.reply_to_message.forward_date and \
-            m.reply_to_message.id or None
-        # Prefer the actual forwarded message ID in the channel
         st["reply_to_channel_msg_id"] = getattr(
             m.reply_to_message, "forward_from_message_id", None
         )
     else:
         st["reply_to_channel_msg_id"] = None
     await show_time_menu(m, uid)
-
 
 async def process_broadcast_content_message(c, m, uid):
     st    = user_state[uid]
@@ -1614,8 +1554,6 @@ async def process_broadcast_content_message(c, m, uid):
     if m.reply_to_message:
         post["reply_ref_id"] = m.reply_to_message.id
     queue.append(post)
-    # Sort by original message_id — keeps forwarded batches in the correct
-    # order even when Pyrogram dispatches them out of sequence
     queue.sort(key=lambda p: p["input_msg_id"])
     st["broadcast_queue"] = queue
     pos = next((i+1 for i, p in enumerate(queue) if p["input_msg_id"] == m.id), len(queue))
@@ -1624,12 +1562,10 @@ async def process_broadcast_content_message(c, m, uid):
         f"Send the next post, or tap **✅ Done Adding Posts** when finished."
     )
 
-
 async def process_custom_date(c, m, uid):
     st  = user_state[uid]
     tz  = await get_user_tz(uid)
     txt = (m.text or "").strip()
-    # FIX B4: include year in format string so date is not 1900
     for fmt in ("%d-%b-%Y %I:%M %p", "%d-%b-%Y %H:%M", "%d/%m/%Y %I:%M %p", "%d/%m/%Y %H:%M"):
         try:
             dt = datetime.datetime.strptime(txt, fmt)
@@ -1652,10 +1588,9 @@ async def process_custom_date(c, m, uid):
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TASK CREATION
+#  TASK CREATION / EDITING
 # ─────────────────────────────────────────────────────────────────────────────
 async def process_content_edit_message(c, m, uid):
-    """Handle new content sent to replace an existing task's content."""
     st  = user_state[uid]
     tid = st.get("editing_task_id")
     if not tid:
@@ -1673,7 +1608,6 @@ async def process_content_edit_message(c, m, uid):
     if not task:
         await m.reply("❌ Task no longer exists.")
         return
-    # Preserve schedule and settings from existing task
     try:
         dt = datetime.datetime.fromisoformat(task["start_time"])
         if dt.tzinfo is None:
@@ -1698,7 +1632,6 @@ async def process_content_edit_message(c, m, uid):
     )
 
 async def update_task_logic(uid, q):
-    """Update an existing task's content and/or schedule."""
     st  = user_state[uid]
     tid = st.get("editing_task_id")
     if not tid:
@@ -1710,12 +1643,11 @@ async def update_task_logic(uid, q):
         await q.answer("❌ Task not found.", show_alert=True)
         return
 
-    # Cancel existing scheduler job
     if scheduler:
         try: scheduler.remove_job(tid)
         except Exception: pass
 
-    tz = await get_user_tz(uid)
+    tz         = await get_user_tz(uid)
     start_time = st.get("start_time")
     if not start_time:
         try:
@@ -1747,15 +1679,12 @@ async def update_task_logic(uid, q):
     await save_task(updated)
     add_scheduler_job(updated)
 
-    # Clear editing state
     for key in ("editing_task_id", "content_type", "content_text", "file_id",
                 "entities", "pin", "del", "auto_delete_offset", "interval",
                 "start_time", "src_chat_id", "src_msg_id", "step"):
         user_state[uid].pop(key, None)
 
-    t_str = start_time.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
     await q.answer("✅ Task updated!")
-    # Go back to the task details screen
     await show_task_details(uid, q.message, tid)
 
 async def create_task_logic(uid, q):
@@ -1779,11 +1708,10 @@ async def create_task_logic(uid, q):
             "src_msg_id":         st.get("src_msg_id", 0),
         }]
 
-    base_tid   = int(datetime.datetime.now().timestamp())
-    t_str      = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
-    # FIX B10: use .get() to avoid KeyError
-    interval   = st.get("interval")
-    total      = 0
+    base_tid = int(datetime.datetime.now().timestamp())
+    t_str    = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
+    interval = st.get("interval")
+    total    = 0
 
     for ch_idx, cid in enumerate(targets):
         batch_map = {
@@ -1850,15 +1778,14 @@ def add_scheduler_job(t):
     if dt.tzinfo is None:
         dt = pytz.utc.localize(dt)
 
-async def job_func():
-    async with queue_lock:
-        logger.info(f"🚀 Job {tid} triggered")
-        fresh = await get_single_task(tid)
-        if not fresh:
-            logger.warning(f"Job {tid}: task gone from DB, skipping")
-            return
+    async def job_func():
+        async with queue_lock:
+            logger.info(f"🚀 Job {tid} triggered")
+            fresh = await get_single_task(tid)
+            if not fresh:
+                logger.warning(f"Job {tid}: task gone from DB, skipping")
+                return
 
-            # Calculate next run time
             next_iso = None
             if fresh["repeat_interval"]:
                 try:
@@ -1889,9 +1816,6 @@ async def job_func():
 
                     target_int  = int(fresh["chat_id"])
 
-                    # Get access_hash — fetch from dialogs if not in DB (handles
-                    # channels added before access_hash was stored, and refreshes
-                    # stale values).
                     access_hash = await get_channel_access_hash(
                         fresh["owner_id"], fresh["chat_id"]
                     )
@@ -1913,7 +1837,6 @@ async def job_func():
                     ents     = deserialize_entities(fresh["entities"])
                     reply_id = None
 
-                    # Delete previous message if requested
                     if fresh["delete_old"] and fresh.get("last_msg_id"):
                         try:
                             await user.delete_messages(target_int, fresh["last_msg_id"])
@@ -1923,16 +1846,14 @@ async def job_func():
                         except Exception as e:
                             logger.warning(f"Job {tid}: delete old failed: {e}")
 
-                    # ── FIX: resolve reply_id for both batch threading and direct channel msg reply
+                    # Resolve reply_id for both batch threading and direct channel msg reply
                     if fresh.get("reply_target"):
                         ref_val = fresh["reply_target"]
                         if ref_val.startswith("task_"):
-                            # Batch thread reply — look up the sibling task's last sent msg
                             ref = await get_single_task(ref_val)
                             if ref and ref.get("last_msg_id"):
                                 reply_id = ref["last_msg_id"]
                         else:
-                            # Direct channel message ID stored as a plain integer string
                             try:
                                 reply_id = int(ref_val)
                             except (ValueError, TypeError):
@@ -1949,7 +1870,7 @@ async def job_func():
                                 entities=ents,
                                 parse_mode=None,
                                 reply_to_message_id=reply_id,
-                                disable_web_page_preview=True,   # ── FIX: was False
+                                disable_web_page_preview=True
                             )
                         elif ct == "poll":
                             pd = json.loads(caption)
@@ -1995,8 +1916,9 @@ async def job_func():
                     try:
                         await _send()
                     except (errors.FileIdInvalid, errors.MediaEmpty):
-                        logger.warning(f"Job {tid}: {ct} file invalid/empty — re-downloading for re-upload")
-                        # Try to re-download via bot first; fall back to src message copy
+                        logger.warning(
+                            f"Job {tid}: {ct} file invalid/empty — re-downloading for re-upload"
+                        )
                         media = None
                         if fid:
                             try:
@@ -2005,8 +1927,6 @@ async def job_func():
                                 logger.warning(f"Job {tid}: bot download failed: {dl_e}")
                         if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
                             try:
-                                # Copy the original message to the user's saved messages
-                                # to get a fresh file reference from a known-good source
                                 media_msg = await app.forward_messages(
                                     fresh["owner_id"],
                                     from_chat_id=fresh["src_chat_id"],
@@ -2101,6 +2021,7 @@ async def job_func():
             DateTrigger(run_date=dt, timezone=pytz.utc),
             id=tid, replace_existing=True, misfire_grace_time=3600
         )
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
