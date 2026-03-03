@@ -1693,5 +1693,6 @@ async def main():
     await idle()
     await app.stop()
     logger.info("🛑 AutoCast bot stopped.")
+
 if __name__ == "__main__":
-    app.run(main()
+    app.run(main())
