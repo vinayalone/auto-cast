@@ -159,13 +159,17 @@ async def init_db():
                 start_time        TEXT,
                 last_msg_id       BIGINT,
                 auto_delete_offset INTEGER DEFAULT 0,
-                reply_target      TEXT
+                reply_target      TEXT,
+                src_chat_id       BIGINT DEFAULT 0,
+                src_msg_id        BIGINT DEFAULT 0
             );
         """)
         # Safe column migrations for existing deployments
         for sql in [
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
+            "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS src_chat_id BIGINT DEFAULT 0",
+            "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS src_msg_id  BIGINT DEFAULT 0",
             "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'",
             "ALTER TABLE userbot_channels  ADD COLUMN IF NOT EXISTS access_hash BIGINT DEFAULT 0",
         ]:
@@ -313,18 +317,29 @@ async def save_task(t):
         INSERT INTO userbot_tasks_v11 (
             task_id, owner_id, chat_id, content_type, content_text,
             file_id, entities, pin, delete_old, repeat_interval,
-            start_time, last_msg_id, auto_delete_offset, reply_target
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            start_time, last_msg_id, auto_delete_offset, reply_target,
+            src_chat_id, src_msg_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
         ON CONFLICT (task_id) DO UPDATE SET
-            last_msg_id        = $12,
+            content_type       = $4,
+            content_text       = $5,
+            file_id            = $6,
+            entities           = $7,
+            pin                = $8,
+            delete_old         = $9,
+            repeat_interval    = $10,
             start_time         = $11,
-            auto_delete_offset = $13
+            last_msg_id        = $12,
+            auto_delete_offset = $13,
+            src_chat_id        = $15,
+            src_msg_id         = $16
     """,
         t["task_id"], t["owner_id"], t["chat_id"],
         t["content_type"], t["content_text"], t["file_id"],
         t["entities"], t["pin"], t["delete_old"], t["repeat_interval"],
         t["start_time"], t["last_msg_id"],
-        t.get("auto_delete_offset", 0), t.get("reply_target")
+        t.get("auto_delete_offset", 0), t.get("reply_target"),
+        t.get("src_chat_id", 0), t.get("src_msg_id", 0)
     )
 
 async def get_all_tasks():
@@ -703,19 +718,24 @@ async def show_task_details(uid, m, tid):
     type_str = type_map.get(t["content_type"], "📁 File")
     txt = (
         f"⚙️ **Task Details**\n\n"
-        f"📝 **Preview:** `{(t['content_text'] or 'Media')[:60]}…`\n"
         f"📂 **Type:** {type_str}\n"
+        f"📝 **Content:** `{(t['content_text'] or 'Media')[:60]}…`\n"
         f"📅 **Scheduled:** `{time_str}`\n"
-        f"🔁 **Repeat:** `{t['repeat_interval'] or 'No'}`\n"
+        f"🔁 **Repeat:** `{t['repeat_interval'] or 'Once'}`\n"
         f"📌 **Pin:** {'✅' if t['pin'] else '❌'} | "
-        f"🗑 **Del Old:** {'✅' if t['delete_old'] else '❌'}\n"
-        f"⏰ **Auto-Delete:** {t.get('auto_delete_offset') or 'OFF'}"
+        f"🗑 **Del Old:** {'✅' if t['delete_old'] else '❌'} | "
+        f"⏰ **Auto-Delete:** {str(t.get('auto_delete_offset') or 0)+'m' if t.get('auto_delete_offset') else 'OFF'}"
     )
     kb = [
-        [InlineKeyboardButton("🗑 Delete Task",    callback_data=f"del_task_{tid}")],
+        [InlineKeyboardButton("👁 Preview Post",  callback_data=f"prev_{tid}"),
+         InlineKeyboardButton("✏️ Change Post",  callback_data=f"edit_content_{tid}")],
+        [InlineKeyboardButton("🗓 Reschedule",    callback_data=f"reschedule_{tid}"),
+         InlineKeyboardButton("⚙️ Settings",     callback_data=f"edit_settings_{tid}")],
+        [InlineKeyboardButton("🗑 Delete Task",   callback_data=f"del_task_{tid}")],
         [InlineKeyboardButton("🔙 Back to List",  callback_data=f"back_list_{t['chat_id']}")],
     ]
     await update_menu(m, txt, kb, uid)
+
 
 async def show_broadcast_selection(uid, m):
     chs = await get_channels(uid)
@@ -938,6 +958,101 @@ async def _handle_callback(c, q, uid, d):
         else:
             await show_main_menu(q.message, uid)
 
+    elif d.startswith("prev_"):
+        tid = d[5:]
+        task = await get_single_task(tid)
+        if not task:
+            await q.answer("❌ Task not found.", show_alert=True)
+            return
+        # Try to show last sent message first, else show original source
+        previewed = False
+        if task.get("last_msg_id") and task.get("chat_id"):
+            try:
+                await app.copy_message(
+                    chat_id=uid,
+                    from_chat_id=int(task["chat_id"]),
+                    message_id=task["last_msg_id"]
+                )
+                await q.answer("✅ Last sent post forwarded to you!")
+                previewed = True
+            except Exception:
+                pass
+        if not previewed and task.get("src_chat_id") and task.get("src_msg_id"):
+            try:
+                await app.copy_message(
+                    chat_id=uid,
+                    from_chat_id=task["src_chat_id"],
+                    message_id=task["src_msg_id"]
+                )
+                await q.answer("✅ Original post forwarded to you!")
+                previewed = True
+            except Exception:
+                pass
+        if not previewed:
+            await q.answer("❌ Cannot preview — post not yet sent and original unavailable.", show_alert=True)
+
+    elif d.startswith("edit_content_"):
+        tid = d[13:]
+        task = await get_single_task(tid)
+        if not task:
+            await q.answer("❌ Task not found.", show_alert=True)
+            return
+        user_state[uid]["editing_task_id"] = tid
+        user_state[uid]["step"] = "waiting_content_edit"
+        await update_menu(
+            q.message,
+            "✏️ **Change Post Content**\n\n"
+            "Send me the new content for this task:\n"
+            "• Text  • Photo  • Video  • Audio\n"
+            "• Voice Note  • Document  • Poll  • Sticker",
+            [[InlineKeyboardButton("🔙 Cancel", callback_data=f"view_{tid}")]],
+            uid
+        )
+
+    elif d.startswith("reschedule_"):
+        tid = d[11:]
+        task = await get_single_task(tid)
+        if not task:
+            await q.answer("❌ Task not found.", show_alert=True)
+            return
+        # Preload existing task into state for re-use
+        user_state[uid]["editing_task_id"] = tid
+        user_state[uid]["content_type"]    = task["content_type"]
+        user_state[uid]["content_text"]    = task["content_text"]
+        user_state[uid]["file_id"]         = task["file_id"]
+        user_state[uid]["entities"]        = task["entities"]
+        user_state[uid]["pin"]             = task["pin"]
+        user_state[uid]["del"]             = task["delete_old"]
+        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
+        user_state[uid]["interval"]        = task["repeat_interval"]
+        user_state[uid]["step"]            = "rescheduling"
+        await show_time_menu(q.message, uid, force_new=True)
+
+    elif d.startswith("edit_settings_"):
+        tid = d[14:]
+        task = await get_single_task(tid)
+        if not task:
+            await q.answer("❌ Task not found.", show_alert=True)
+            return
+        user_state[uid]["editing_task_id"] = tid
+        user_state[uid]["content_type"]    = task["content_type"]
+        user_state[uid]["content_text"]    = task["content_text"]
+        user_state[uid]["file_id"]         = task["file_id"]
+        user_state[uid]["entities"]        = task["entities"]
+        user_state[uid]["pin"]             = task["pin"]
+        user_state[uid]["del"]             = task["delete_old"]
+        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
+        user_state[uid]["interval"]        = task["repeat_interval"]
+        # Reconstruct start_time
+        try:
+            dt = datetime.datetime.fromisoformat(task["start_time"])
+            if dt.tzinfo is None:
+                dt = pytz.utc.localize(dt)
+            user_state[uid]["start_time"] = dt
+        except Exception:
+            pass
+        await ask_settings(q.message, uid, force_new=True)
+
     # ── BROADCAST ─────────────────────────────────────────────────────────────
     elif d == "broadcast_start":
         user_state[uid]["step"] = "broadcast_select_channels"
@@ -1058,7 +1173,11 @@ async def _handle_callback(c, q, uid, d):
                 second=0, microsecond=0
             )
         user_state[uid]["start_time"] = run_time
-        await ask_repetition(q.message, uid)
+        # If rescheduling an existing task, skip to confirm directly
+        if user_state[uid].get("step") == "rescheduling":
+            await confirm_task(q.message, uid)
+        else:
+            await ask_repetition(q.message, uid)
 
     # ── REPETITION ────────────────────────────────────────────────────────────
     elif d.startswith("rep_"):
@@ -1137,7 +1256,10 @@ async def _handle_callback(c, q, uid, d):
         await confirm_task(q.message, uid)
 
     elif d == "save_task":
-        await create_task_logic(uid, q)
+        if user_state[uid].get("editing_task_id"):
+            await update_task_logic(uid, q)
+        else:
+            await create_task_logic(uid, q)
 
     else:
         await q.answer("Unknown action.", show_alert=False)
@@ -1178,6 +1300,9 @@ async def handle_inputs(c, m):
 
     if step == "waiting_content":
         await process_content_message(c, m, uid)
+
+    elif step == "waiting_content_edit":
+        await process_content_edit_message(c, m, uid)
 
     elif step == "waiting_broadcast_content":
         await process_broadcast_content_message(c, m, uid)
@@ -1395,31 +1520,41 @@ async def process_content_message(c, m, uid):
     st["file_id"]      = _extract_file_id(m)
     st["entities"]     = serialize_entities(m.caption_entities or m.entities)
     st["input_msg_id"] = m.id
+    st["src_chat_id"]  = m.chat.id
+    st["src_msg_id"]   = m.id
     if m.reply_to_message:
         st["reply_ref_id"] = m.reply_to_message.id
     await show_time_menu(m, uid)
+
 
 async def process_broadcast_content_message(c, m, uid):
     st    = user_state[uid]
     queue = st.get("broadcast_queue", [])
     post  = {
-        "content_type":      m.media.value if m.media else "text",
-        "content_text":      m.caption or m.text,
-        "file_id":           _extract_file_id(m),
-        "entities":          serialize_entities(m.caption_entities or m.entities),
-        "input_msg_id":      m.id,
-        "pin":               True,
-        "delete_old":        True,
+        "content_type":       m.media.value if m.media else "text",
+        "content_text":       m.caption or m.text,
+        "file_id":            _extract_file_id(m),
+        "entities":           serialize_entities(m.caption_entities or m.entities),
+        "input_msg_id":       m.id,
+        "src_chat_id":        m.chat.id,
+        "src_msg_id":         m.id,
+        "pin":                True,
+        "delete_old":         True,
         "auto_delete_offset": 0,
     }
     if m.reply_to_message:
         post["reply_ref_id"] = m.reply_to_message.id
     queue.append(post)
+    # Sort by original message_id — keeps forwarded batches in the correct
+    # order even when Pyrogram dispatches them out of sequence
+    queue.sort(key=lambda p: p["input_msg_id"])
     st["broadcast_queue"] = queue
+    pos = next((i+1 for i, p in enumerate(queue) if p["input_msg_id"] == m.id), len(queue))
     await m.reply(
-        f"✅ Post #{len(queue)} added.\n"
+        f"✅ Post #{pos} added. ({len(queue)} total in queue)\n"
         f"Send the next post, or tap **✅ Done Adding Posts** when finished."
     )
+
 
 async def process_custom_date(c, m, uid):
     st  = user_state[uid]
@@ -1450,6 +1585,115 @@ async def process_custom_date(c, m, uid):
 # ─────────────────────────────────────────────────────────────────────────────
 #  TASK CREATION
 # ─────────────────────────────────────────────────────────────────────────────
+async def process_content_edit_message(c, m, uid):
+    """Handle new content sent to replace an existing task's content."""
+    st  = user_state[uid]
+    tid = st.get("editing_task_id")
+    if not tid:
+        await m.reply("❌ No task selected for editing.")
+        return
+    st["content_type"] = m.media.value if m.media else "text"
+    st["content_text"] = m.caption or m.text
+    st["file_id"]      = _extract_file_id(m)
+    st["entities"]     = serialize_entities(m.caption_entities or m.entities)
+    st["src_chat_id"]  = m.chat.id
+    st["src_msg_id"]   = m.id
+    st["step"] = None
+
+    task = await get_single_task(tid)
+    if not task:
+        await m.reply("❌ Task no longer exists.")
+        return
+    # Preserve schedule and settings from existing task
+    try:
+        dt = datetime.datetime.fromisoformat(task["start_time"])
+        if dt.tzinfo is None:
+            dt = pytz.utc.localize(dt)
+        st["start_time"] = dt
+    except Exception:
+        pass
+    st["interval"]           = task["repeat_interval"]
+    st["pin"]                = task["pin"]
+    st["del"]                = task["delete_old"]
+    st["auto_delete_offset"] = task.get("auto_delete_offset", 0)
+
+    await update_menu(
+        m,
+        "✅ **Content updated!**\n\nWould you like to also change the schedule?",
+        [
+            [InlineKeyboardButton("🗓 Change Schedule",  callback_data=f"reschedule_{tid}")],
+            [InlineKeyboardButton("✅ Save & Keep Time", callback_data="save_task")],
+            [InlineKeyboardButton("🔙 Cancel",           callback_data=f"view_{tid}")],
+        ],
+        uid, force_new=True
+    )
+
+async def update_task_logic(uid, q):
+    """Update an existing task's content and/or schedule."""
+    st  = user_state[uid]
+    tid = st.get("editing_task_id")
+    if not tid:
+        await create_task_logic(uid, q)
+        return
+
+    task = await get_single_task(tid)
+    if not task:
+        await q.answer("❌ Task not found.", show_alert=True)
+        return
+
+    # Cancel existing scheduler job
+    if scheduler:
+        try: scheduler.remove_job(tid)
+        except Exception: pass
+
+    tz = await get_user_tz(uid)
+    start_time = st.get("start_time")
+    if not start_time:
+        try:
+            start_time = datetime.datetime.fromisoformat(task["start_time"])
+            if start_time.tzinfo is None:
+                start_time = pytz.utc.localize(start_time)
+        except Exception:
+            start_time = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=10)
+
+    updated = {
+        "task_id":            tid,
+        "owner_id":           task["owner_id"],
+        "chat_id":            task["chat_id"],
+        "content_type":       st.get("content_type", task["content_type"]),
+        "content_text":       st.get("content_text", task["content_text"]),
+        "file_id":            st.get("file_id",      task["file_id"]),
+        "entities":           st.get("entities",     task["entities"]),
+        "pin":                st.get("pin",          task["pin"]),
+        "delete_old":         st.get("del",          task["delete_old"]),
+        "auto_delete_offset": st.get("auto_delete_offset", task.get("auto_delete_offset", 0)),
+        "repeat_interval":    st.get("interval",     task["repeat_interval"]),
+        "start_time":         start_time.isoformat(),
+        "last_msg_id":        task["last_msg_id"],
+        "reply_target":       task.get("reply_target"),
+        "src_chat_id":        st.get("src_chat_id",  task.get("src_chat_id", 0)),
+        "src_msg_id":         st.get("src_msg_id",   task.get("src_msg_id", 0)),
+    }
+
+    await save_task(updated)
+    add_scheduler_job(updated)
+
+    # Clear editing state
+    for key in ("editing_task_id", "content_type", "content_text", "file_id",
+                "entities", "pin", "del", "auto_delete_offset", "interval",
+                "start_time", "src_chat_id", "src_msg_id", "step"):
+        user_state[uid].pop(key, None)
+
+    t_str = start_time.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
+    await update_menu(
+        q.message,
+        f"✅ **Task Updated!**\n\n"
+        f"📅 **New Time:** `{t_str}`\n"
+        f"🔁 **Repeat:** `{updated['repeat_interval'] or 'Once'}`\n\n"
+        f"Use /manage to view your tasks.",
+        None, uid, force_new=False
+    )
+
 async def create_task_logic(uid, q):
     st      = user_state[uid]
     targets = st.get("broadcast_targets", [st.get("target")])
@@ -1467,6 +1711,8 @@ async def create_task_logic(uid, q):
             "pin":                st.get("pin", True),
             "delete_old":         st.get("del", True),
             "auto_delete_offset": st.get("auto_delete_offset", 0),
+            "src_chat_id":        st.get("src_chat_id", 0),
+            "src_msg_id":         st.get("src_msg_id", 0),
         }]
 
     base_tid   = int(datetime.datetime.now().timestamp())
@@ -1504,6 +1750,8 @@ async def create_task_logic(uid, q):
                 "start_time":         run_time.isoformat(),
                 "last_msg_id":        None,
                 "reply_target":       reply_target,
+                "src_chat_id":        post.get("src_chat_id", 0),
+                "src_msg_id":         post.get("src_msg_id", 0),
             }
             try:
                 await save_task(task_data)
@@ -1668,26 +1916,49 @@ def add_scheduler_job(t):
 
                     try:
                         await _send()
-                    except errors.FileIdInvalid:
-                        logger.warning(f"Job {tid}: FileIdInvalid, attempting re-upload")
-                        media = await app.download_media(fid, in_memory=True)
-                        if ct == "photo":
-                            sent = await user.send_photo(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                        elif ct == "video":
-                            sent = await user.send_video(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                        elif ct == "animation":
-                            sent = await user.send_animation(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                        elif ct == "document":
-                            sent = await user.send_document(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                        elif ct == "audio":
-                            media.name = "audio.mp3"
-                            sent = await user.send_audio(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                        elif ct == "voice":
-                            media.name = "voice.ogg"
-                            sent = await user.send_voice(target_int, media, caption=caption, reply_to_message_id=reply_id)
-                        elif ct == "sticker":
-                            logger.error(f"Job {tid}: sticker re-upload not supported")
+                    except (errors.FileIdInvalid, errors.MediaEmpty):
+                        logger.warning(f"Job {tid}: {ct} file invalid/empty — re-downloading for re-upload")
+                        # Try to re-download via bot first; fall back to src message copy
+                        media = None
+                        if fid:
+                            try:
+                                media = await app.download_media(fid, in_memory=True)
+                            except Exception as dl_e:
+                                logger.warning(f"Job {tid}: bot download failed: {dl_e}")
+                        if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
+                            try:
+                                # Copy the original message to the user's saved messages
+                                # to get a fresh file reference from a known-good source
+                                media_msg = await app.forward_messages(
+                                    fresh["owner_id"],
+                                    from_chat_id=fresh["src_chat_id"],
+                                    message_ids=fresh["src_msg_id"]
+                                )
+                                media = await app.download_media(media_msg, in_memory=True)
+                                await media_msg.delete()
+                            except Exception as fwd_e:
+                                logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
+                        if media is None:
+                            logger.error(f"Job {tid}: cannot recover media for {ct}, skipping")
                             sent = None
+                        else:
+                            if ct == "photo":
+                                sent = await user.send_photo(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            elif ct == "video":
+                                sent = await user.send_video(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            elif ct == "animation":
+                                sent = await user.send_animation(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            elif ct == "document":
+                                sent = await user.send_document(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            elif ct == "audio":
+                                media.name = "audio.mp3"
+                                sent = await user.send_audio(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                            elif ct == "voice":
+                                media.name = "voice.ogg"
+                                sent = await user.send_voice(target_int, media, caption=caption, reply_to_message_id=reply_id)
+                            elif ct == "sticker":
+                                logger.error(f"Job {tid}: sticker re-upload not supported")
+                                sent = None
 
                     if sent:
                         logger.info(f"Job {tid}: sent msg {sent.id}")
