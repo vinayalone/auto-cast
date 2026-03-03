@@ -573,6 +573,7 @@ async def ask_repetition(m, uid, force_new=False):
         [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
         [InlineKeyboardButton("Every 2 Days",         callback_data="rep_2880"),
          InlineKeyboardButton("Every 1 Week",         callback_data="rep_10080")],
+        [InlineKeyboardButton("Every 2 Weeks",        callback_data="rep_20160")],
         [InlineKeyboardButton("🔙 Back",              callback_data="step_time")],
     ]
     await update_menu(m, "3️⃣ **Repetition**\n\nHow often should this post repeat?", kb, uid, force_new)
@@ -1105,6 +1106,7 @@ async def _handle_callback(c, q, uid, d):
             [InlineKeyboardButton("Every 24 Hours",       callback_data="rep_1440")],
             [InlineKeyboardButton("Every 2 Days",         callback_data="rep_2880"),
              InlineKeyboardButton("Every 1 Week",         callback_data="rep_10080")],
+            [InlineKeyboardButton("Every 2 Weeks",        callback_data="rep_20160")],
             [InlineKeyboardButton("🔙 Back",              callback_data=f"view_{tid}")],
         ]
         await update_menu(
@@ -1553,13 +1555,14 @@ async def process_content_message(c, m, uid):
     st["input_msg_id"] = m.id
     st["src_chat_id"]  = m.chat.id
     st["src_msg_id"]   = m.id
-    # Store the original channel message ID the user replied to (for thread reply)
-    if m.reply_to_message and m.reply_to_message.forward_from_chat:
-        st["reply_to_channel_msg_id"] = getattr(
-            m.reply_to_message, "forward_from_message_id", None
-        )
-    else:
-        st["reply_to_channel_msg_id"] = None
+    # Store the original channel message ID the user replied to (for thread reply).
+    # We do NOT require forward_from_chat to be set — messages with link previews
+    # often omit it even when forwarded from a channel.
+    st["reply_to_channel_msg_id"] = None
+    if m.reply_to_message:
+        fwd_msg_id = getattr(m.reply_to_message, "forward_from_message_id", None)
+        if fwd_msg_id:
+            st["reply_to_channel_msg_id"] = fwd_msg_id
     await show_time_menu(m, uid)
 
 async def process_broadcast_content_message(c, m, uid):
@@ -1815,11 +1818,12 @@ def add_scheduler_job(t):
             next_iso = None
             if fresh["repeat_interval"]:
                 try:
-                    last = datetime.datetime.fromisoformat(fresh["start_time"])
-                    if last.tzinfo is None:
-                        last = pytz.utc.localize(last)
                     mins = int(fresh["repeat_interval"].split("=")[1])
-                    next_iso = (last + datetime.timedelta(minutes=mins)).isoformat()
+                    # Use current time as base so next_run display is always accurate,
+                    # even if the job fired late (e.g. bot was restarting).
+                    next_iso = (
+                        datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=mins)
+                    ).isoformat()
                 except Exception as e:
                     logger.error(f"Next-run calc error for {tid}: {e}")
 
