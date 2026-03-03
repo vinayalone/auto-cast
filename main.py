@@ -1359,7 +1359,7 @@ async def process_custom_date(c, m, uid):
                 return
             st["start_time"] = dt
             st["step"] = None
-            await ask_repetition(m, uid)
+            await ask_repetition(m, uid, force_new=True)
             return
         except ValueError:
             continue
@@ -1508,6 +1508,13 @@ def add_scheduler_job(t):
                     caption  = fresh["content_text"]
                     ents     = deserialize_entities(fresh["entities"])
                     reply_id = None
+
+                    # ── Resolve peer: :memory: clients have no cache,
+                    #    get_chat() forces Pyrogram to fetch & cache the peer ──
+                    try:
+                        await user.get_chat(target)
+                    except Exception as peer_err:
+                        logger.warning(f"Job {tid}: peer resolve warning: {peer_err}")
 
                     if fresh.get("reply_target"):
                         ref = await get_single_task(fresh["reply_target"])
@@ -1686,6 +1693,5 @@ async def main():
     await idle()
     await app.stop()
     logger.info("🛑 AutoCast bot stopped.")
-
 if __name__ == "__main__":
-    app.run(main())
+    app.run(main()
