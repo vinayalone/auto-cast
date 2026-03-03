@@ -1851,12 +1851,12 @@ def add_scheduler_job(t):
         dt = pytz.utc.localize(dt)
 
 async def job_func():
-        async with queue_lock:
-            logger.info(f"🚀 Job {tid} triggered")
-            fresh = await get_single_task(tid)
-            if not fresh:
-                logger.warning(f"Job {tid}: task gone from DB, skipping")
-                return
+    async with queue_lock:
+        logger.info(f"🚀 Job {tid} triggered")
+        fresh = await get_single_task(tid)
+        if not fresh:
+            logger.warning(f"Job {tid}: task gone from DB, skipping")
+            return
 
             # Calculate next run time
             next_iso = None
