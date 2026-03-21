@@ -3,3 +3,5 @@ TgCrypto
 asyncpg
 APScheduler==3.10.4
 pytz
+cryptography
+cryptography

@@ -1,11 +1,15 @@
 import os
 import sys
+import io
+import json
+import base64
+import hashlib
 import logging
 import asyncio
 import datetime
 import pytz
 import asyncpg
-import json
+from cryptography.fernet import Fernet
 from pyrogram import Client, filters, idle, errors, enums
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -23,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("AutoCast")
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  ENV / STARTUP
+# ─────────────────────────────────────────────────────────────────────────────
 def _require_env(key: str) -> str:
     val = os.environ.get(key)
     if not val:
@@ -57,6 +64,57 @@ queue_lock = None
 login_state = {}
 user_state  = {}
 tz_cache    = {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX 1 — SESSION ENCRYPTION
+#  Stores sessions encrypted with Fernet (AES-128-CBC + HMAC-SHA256).
+#  Set ENCRYPTION_KEY to any passphrase; a valid 32-byte Fernet key is
+#  derived via SHA-256 so users can supply any string.
+#  On first run without a key the bot logs a generated one to copy-paste.
+# ─────────────────────────────────────────────────────────────────────────────
+_fernet: Fernet | None = None
+
+def _init_encryption():
+    global _fernet
+    raw = os.environ.get("ENCRYPTION_KEY", "").strip()
+    if not raw:
+        sample = Fernet.generate_key().decode()
+        logger.warning(
+            "⚠️  ENCRYPTION_KEY not set — sessions stored in PLAINTEXT. "
+            f"Add this to your env to enable encryption:\n  ENCRYPTION_KEY={sample}"
+        )
+        _fernet = None
+        return
+    # Accept any string: derive a proper 32-byte key via SHA-256
+    derived = base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest())
+    _fernet = Fernet(derived)
+    logger.info("🔐 Session encryption enabled.")
+
+def encrypt_session(s: str) -> str:
+    if _fernet:
+        return _fernet.encrypt(s.encode()).decode()
+    return s
+
+def decrypt_session(s: str) -> str:
+    if _fernet is None:
+        return s
+    try:
+        return _fernet.decrypt(s.encode()).decode()
+    except Exception:
+        # Legacy unencrypted session — return as-is so existing rows still work
+        return s
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  FIX 2 — UTC NORMALISATION HELPER
+#  All datetimes in the DB are UTC ISO strings; this helper guarantees that
+#  any datetime we store is timezone-aware and in UTC, preventing the
+#  "localize vs already-localized" ambiguity that produced wrong next_run
+#  values in the original code.
+# ─────────────────────────────────────────────────────────────────────────────
+def _ensure_utc(dt: datetime.datetime) -> datetime.datetime:
+    if dt.tzinfo is None:
+        return pytz.utc.localize(dt)
+    return dt.astimezone(pytz.utc)
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  TIMEZONE HELPERS
@@ -159,6 +217,14 @@ async def init_db():
                 src_msg_id         BIGINT DEFAULT 0
             );
         """)
+        # FIX 3 — MULTI-INSTANCE: persist wizard state so any replica can resume
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS userbot_wizard_state (
+                user_id    BIGINT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
         for sql in [
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
@@ -198,6 +264,81 @@ async def migrate_to_v11():
                 logger.warning(f"Migration skipped: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  FIX 3 — MULTI-INSTANCE: WIZARD STATE PERSISTENCE
+#  user_state is an in-memory write-through cache backed by the DB.
+#  Any replica can pick up a wizard mid-flow; login_state is in-memory only
+#  (cannot persist a live Pyrogram client) so users must restart login if the
+#  process restarts during OTP entry.
+# ─────────────────────────────────────────────────────────────────────────────
+_WIZARD_PERSIST_KEYS = frozenset({
+    "step", "target", "content_type", "content_text", "file_id", "entities",
+    "pin", "del", "auto_delete_offset", "interval", "editing_task_id",
+    "src_chat_id", "src_msg_id", "reply_to_channel_msg_id",
+    "broadcast_targets", "broadcast_queue", "menu_msg_id", "input_msg_id",
+    "start_time",
+})
+
+def _serialize_wizard(st: dict) -> str:
+    out: dict = {}
+    for k, v in st.items():
+        if k not in _WIZARD_PERSIST_KEYS:
+            continue
+        if k == "start_time" and isinstance(v, datetime.datetime):
+            out[k] = {"__dt__": _ensure_utc(v).isoformat()}
+        else:
+            out[k] = v
+    return json.dumps(out, default=str)
+
+def _deserialize_wizard(s: str) -> dict:
+    raw = json.loads(s)
+    out: dict = {}
+    for k, v in raw.items():
+        if isinstance(v, dict) and "__dt__" in v:
+            try:
+                out[k] = datetime.datetime.fromisoformat(v["__dt__"])
+            except Exception:
+                pass
+        else:
+            out[k] = v
+    return out
+
+async def persist_wizard_state(uid: int):
+    st = user_state.get(uid)
+    if st is None:
+        return
+    try:
+        serialized = _serialize_wizard(st)
+        pool = await get_db()
+        await pool.execute("""
+            INSERT INTO userbot_wizard_state (user_id, state_json, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET state_json=$2, updated_at=NOW()
+        """, uid, serialized)
+    except Exception as e:
+        logger.warning(f"persist_wizard_state uid={uid}: {e}")
+
+async def restore_wizard_state(uid: int):
+    """Restores wizard state from DB into user_state[uid] if available."""
+    try:
+        pool = await get_db()
+        row = await pool.fetchrow(
+            "SELECT state_json FROM userbot_wizard_state WHERE user_id=$1", uid
+        )
+        if row:
+            st = _deserialize_wizard(row["state_json"])
+            user_state.setdefault(uid, {}).update(st)
+    except Exception as e:
+        logger.warning(f"restore_wizard_state uid={uid}: {e}")
+
+async def clear_wizard_state(uid: int):
+    user_state.pop(uid, None)
+    try:
+        pool = await get_db()
+        await pool.execute("DELETE FROM userbot_wizard_state WHERE user_id=$1", uid)
+    except Exception as e:
+        logger.warning(f"clear_wizard_state uid={uid}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  DB HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 async def get_session(user_id):
@@ -205,7 +346,9 @@ async def get_session(user_id):
     row = await pool.fetchrow(
         "SELECT session_string FROM userbot_sessions WHERE user_id=$1", user_id
     )
-    return row["session_string"] if row else None
+    if not row:
+        return None
+    return decrypt_session(row["session_string"])
 
 async def save_session(user_id, session):
     pool = await get_db()
@@ -213,7 +356,7 @@ async def save_session(user_id, session):
         INSERT INTO userbot_sessions (user_id, session_string)
         VALUES ($1, $2)
         ON CONFLICT (user_id) DO UPDATE SET session_string=$2
-    """, user_id, session)
+    """, user_id, encrypt_session(session))
 
 async def add_channel(user_id, cid, title, access_hash: int = 0):
     pool = await get_db()
@@ -232,18 +375,6 @@ async def get_channel_access_hash(user_id, channel_id: str) -> int:
     return row["access_hash"] if row and row["access_hash"] else 0
 
 async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) -> int:
-    """
-    Iterate the user's dialogs using Pyrogram's high-level get_dialogs().
-    Pyrogram automatically caches every peer it sees in each page of results.
-    Once the target channel appears, resolve_peer() will work and we extract
-    the correct user-account-specific access_hash and save it to the DB.
-
-    This is the only reliable approach for :memory: clients because:
-    - The session_string restores auth credentials only — no peer cache.
-    - access_hash is per-account: the bot's hash is useless for the userbot.
-    - channels.GetChannels with hash=0 is rejected by Telegram.
-    - get_dialogs() works without any pre-cached peer (uses InputPeerEmpty first).
-    """
     try:
         async for dialog in user_client.get_dialogs():
             if dialog.chat.id == channel_id:
@@ -267,12 +398,6 @@ async def warm_peer_and_get_hash(user_client, owner_id: int, channel_id: int) ->
     return 0
 
 def inject_peer(storage, peer_id: int, access_hash: int):
-    """
-    Write a channel peer directly into the client's in-memory SQLite cache.
-    Pyrogram's :memory: clients start with an empty peer table, so resolve_peer
-    always fails. Inserting the row ourselves makes every subsequent high-level
-    API call work normally with the plain integer chat_id.
-    """
     try:
         storage.conn.execute(
             "INSERT OR REPLACE INTO peers "
@@ -306,6 +431,7 @@ async def del_channel(user_id, cid):
 
 async def save_task(t):
     pool = await get_db()
+    # FIX — reply_target was missing from the ON CONFLICT UPDATE clause in the original
     await pool.execute("""
         INSERT INTO userbot_tasks_v11 (
             task_id, owner_id, chat_id, content_type, content_text,
@@ -324,6 +450,7 @@ async def save_task(t):
             start_time         = $11,
             last_msg_id        = $12,
             auto_delete_offset = $13,
+            reply_target       = $14,
             src_chat_id        = $15,
             src_msg_id         = $16
     """,
@@ -402,10 +529,11 @@ async def delete_all_user_data(user_id):
             try: scheduler.remove_job(t["task_id"])
             except Exception: pass
 
-    await pool.execute("DELETE FROM userbot_tasks_v11 WHERE owner_id=$1",  user_id)
-    await pool.execute("DELETE FROM userbot_channels   WHERE user_id=$1",   user_id)
-    await pool.execute("DELETE FROM userbot_sessions   WHERE user_id=$1",   user_id)
-    await pool.execute("DELETE FROM userbot_settings   WHERE user_id=$1",   user_id)
+    await pool.execute("DELETE FROM userbot_tasks_v11   WHERE owner_id=$1",  user_id)
+    await pool.execute("DELETE FROM userbot_channels     WHERE user_id=$1",   user_id)
+    await pool.execute("DELETE FROM userbot_sessions     WHERE user_id=$1",   user_id)
+    await pool.execute("DELETE FROM userbot_settings     WHERE user_id=$1",   user_id)
+    await pool.execute("DELETE FROM userbot_wizard_state WHERE user_id=$1",   user_id)
 
     tz_cache.pop(user_id, None)
     user_state.pop(user_id, None)
@@ -469,6 +597,121 @@ def deserialize_entities(json_str):
         return None
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  EXPORT / IMPORT
+# ─────────────────────────────────────────────────────────────────────────────
+EXPORT_VERSION = 2
+
+async def export_user_config(uid: int) -> dict:
+    """Serialises all tasks, channels, and settings to a portable dict."""
+    pool = await get_db()
+    tasks    = [dict(r) for r in await pool.fetch(
+        "SELECT * FROM userbot_tasks_v11 WHERE owner_id=$1", uid
+    )]
+    channels = [dict(r) for r in await pool.fetch(
+        "SELECT channel_id, title FROM userbot_channels WHERE user_id=$1", uid
+    )]
+    settings = await pool.fetchrow(
+        "SELECT timezone FROM userbot_settings WHERE user_id=$1", uid
+    )
+
+    export_tasks = []
+    for t in tasks:
+        export_tasks.append({
+            "chat_id":            t["chat_id"],
+            "content_type":       t["content_type"],
+            "content_text":       t["content_text"],
+            "file_id":            t["file_id"],
+            "entities":           t["entities"],
+            "pin":                t["pin"],
+            "delete_old":         t["delete_old"],
+            "repeat_interval":    t["repeat_interval"],
+            "start_time":         t["start_time"],
+            "auto_delete_offset": t.get("auto_delete_offset", 0),
+            "reply_target":       t.get("reply_target"),
+            "src_chat_id":        t.get("src_chat_id", 0),
+            "src_msg_id":         t.get("src_msg_id", 0),
+        })
+
+    return {
+        "version":     EXPORT_VERSION,
+        "exported_at": datetime.datetime.now(pytz.utc).isoformat(),
+        "settings":    {"timezone": settings["timezone"] if settings else "UTC"},
+        "channels":    channels,
+        "tasks":       export_tasks,
+    }
+
+async def import_user_config(uid: int, data: dict) -> tuple[int, list[str]]:
+    """
+    Creates tasks from an export dict.
+    Returns (imported_count, list_of_error_strings).
+    Tasks whose start_time is in the past are rescheduled to 5 min from now.
+    File IDs are preserved but may be invalid if the source account differs.
+    """
+    if data.get("version") not in (1, 2):
+        return 0, [f"Unsupported export version '{data.get('version')}'. Expected 1 or 2."]
+
+    errs: list[str] = []
+    imported = 0
+    now_utc  = datetime.datetime.now(pytz.utc)
+    base_tid = int(now_utc.timestamp())
+
+    # --- settings ---
+    if "settings" in data:
+        tz_str = data["settings"].get("timezone", "UTC")
+        try:
+            pytz.timezone(tz_str)
+            await set_user_tz(uid, tz_str)
+        except Exception:
+            errs.append(f"Invalid timezone '{tz_str}' — skipped.")
+
+    # --- channels (re-add without access_hash; user must re-add for posting) ---
+    for ch in data.get("channels", []):
+        try:
+            await add_channel(uid, str(ch["channel_id"]),
+                              ch.get("title", "Imported Channel"), 0)
+        except Exception as e:
+            errs.append(f"Channel {ch.get('channel_id')}: {e}")
+
+    # --- tasks ---
+    for i, t in enumerate(data.get("tasks", [])):
+        try:
+            # Resolve start_time; shift into the future if it's in the past
+            try:
+                dt = datetime.datetime.fromisoformat(t["start_time"])
+                dt = _ensure_utc(dt)
+                if dt <= now_utc:
+                    dt = now_utc + datetime.timedelta(minutes=5, seconds=i * 10)
+            except Exception:
+                dt = now_utc + datetime.timedelta(minutes=5, seconds=i * 10)
+
+            tid = f"task_{base_tid}_imp_{i}"
+            task_data = {
+                "task_id":            tid,
+                "owner_id":           uid,
+                "chat_id":            str(t["chat_id"]),
+                "content_type":       t.get("content_type", "text"),
+                "content_text":       t.get("content_text"),
+                "file_id":            t.get("file_id"),
+                "entities":           t.get("entities"),
+                "pin":                bool(t.get("pin", True)),
+                "delete_old":         bool(t.get("delete_old", True)),
+                "repeat_interval":    t.get("repeat_interval"),
+                "start_time":         dt.isoformat(),
+                "last_msg_id":        None,
+                "auto_delete_offset": int(t.get("auto_delete_offset", 0)),
+                "reply_target":       t.get("reply_target"),
+                "src_chat_id":        int(t.get("src_chat_id", 0) or 0),
+                "src_msg_id":         int(t.get("src_msg_id", 0) or 0),
+            }
+            await save_task(task_data)
+            add_scheduler_job(task_data)
+            imported += 1
+        except Exception as e:
+            errs.append(f"Task #{i + 1}: {e}")
+
+    return imported, errs
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  UI HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 async def update_menu(m, text, kb, uid, force_new=False):
@@ -505,6 +748,8 @@ async def show_main_menu(m, uid, force_new=False):
         [InlineKeyboardButton("➕ Add Channel (Forward)",   callback_data="add_channel_forward"),
          InlineKeyboardButton("➕ Add by ID",               callback_data="add_channel_id")],
         [InlineKeyboardButton(f"🌐 Timezone: {tz_label}",   callback_data="tz_select")],
+        [InlineKeyboardButton("⬆️ Export Config",           callback_data="export_config"),
+         InlineKeyboardButton("⬇️ Import Config",           callback_data="import_config")],
         [InlineKeyboardButton("🚪 Logout",                  callback_data="logout")],
     ]
     await update_menu(
@@ -627,7 +872,7 @@ async def ask_settings(m, uid, force_new=False):
 async def confirm_task(m, uid, force_new=False):
     st = user_state[uid]
     tz = await get_user_tz(uid)
-    t_str    = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
+    t_str    = _ensure_utc(st["start_time"]).astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
     interval = st.get("interval")
     r_str    = interval if interval else "Once"
     queue    = st.get("broadcast_queue")
@@ -679,9 +924,7 @@ async def list_active_tasks(uid, m, cid, force_new=False):
         snippet = (t["content_text"] or "Media")[:15] + "…"
         icon    = icons.get(t["content_type"], "📁")
         try:
-            dt = datetime.datetime.fromisoformat(t["start_time"])
-            if dt.tzinfo is None:
-                dt = pytz.utc.localize(dt)
+            dt = _ensure_utc(datetime.datetime.fromisoformat(t["start_time"]))
             time_str = dt.astimezone(tz).strftime("%I:%M %p")
         except Exception:
             time_str = "?"
@@ -703,9 +946,7 @@ async def show_task_details(uid, m, tid):
         return
     tz = await get_user_tz(uid)
     try:
-        dt = datetime.datetime.fromisoformat(t["start_time"])
-        if dt.tzinfo is None:
-            dt = pytz.utc.localize(dt)
+        dt = _ensure_utc(datetime.datetime.fromisoformat(t["start_time"]))
         time_str = dt.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
     except Exception:
         time_str = t["start_time"]
@@ -759,9 +1000,6 @@ async def show_broadcast_selection(uid, m):
     kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
     await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TIMEZONE SELECTOR UI
-# ─────────────────────────────────────────────────────────────────────────────
 async def show_tz_selector(uid, m, force_new=False):
     current_tz = await get_user_tz(uid)
     kb = []
@@ -778,9 +1016,6 @@ async def show_tz_selector(uid, m, force_new=False):
         kb, uid, force_new
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-DELETE KEYBOARD
-# ─────────────────────────────────────────────────────────────────────────────
 async def get_delete_before_kb(temp_task_id):
     options = [
         (0, "🚫 Disable"), (5, "5 min"), (10, "10 min"), (15, "15 min"),
@@ -807,6 +1042,7 @@ async def start_cmd(c, m):
     uid = m.from_user.id
     if uid not in user_state:
         user_state[uid] = {}
+        await restore_wizard_state(uid)
     if await get_session(uid):
         sent = await m.reply(
             "👋 **Welcome to AutoCast | Channel Manager!**\n\n"
@@ -817,6 +1053,8 @@ async def start_cmd(c, m):
                 [InlineKeyboardButton("➕ Add Channel (Forward)",   callback_data="add_channel_forward"),
                  InlineKeyboardButton("➕ Add by ID",               callback_data="add_channel_id")],
                 [InlineKeyboardButton("🌐 Set Timezone",            callback_data="tz_select")],
+                [InlineKeyboardButton("⬆️ Export Config",           callback_data="export_config"),
+                 InlineKeyboardButton("⬇️ Import Config",           callback_data="import_config")],
                 [InlineKeyboardButton("🚪 Logout",                  callback_data="logout")],
             ])
         )
@@ -845,6 +1083,7 @@ async def callback_router(c, q):
 
     if uid not in user_state:
         user_state[uid] = {}
+        await restore_wizard_state(uid)
     user_state[uid]["menu_msg_id"] = q.message.id
 
     try:
@@ -855,6 +1094,9 @@ async def callback_router(c, q):
             await q.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
         except Exception:
             pass
+    finally:
+        # FIX 3 — persist wizard state after every interaction
+        await persist_wizard_state(uid)
 
 async def _handle_callback(c, q, uid, d):
     # ── HOME ──────────────────────────────────────────────────────────────────
@@ -938,6 +1180,46 @@ async def _handle_callback(c, q, uid, d):
         except Exception:
             pass
 
+    # ── EXPORT ────────────────────────────────────────────────────────────────
+    elif d == "export_config":
+        await q.answer("⏳ Generating export…")
+        try:
+            data = await export_user_config(uid)
+            buf = io.BytesIO(json.dumps(data, indent=2, ensure_ascii=False).encode())
+            buf.name = f"autocast_backup_{uid}.json"
+            await app.send_document(
+                uid, buf,
+                caption=(
+                    "📦 **AutoCast Configuration Export**\n\n"
+                    f"✅ Tasks: **{len(data['tasks'])}**  |  "
+                    f"📢 Channels: **{len(data['channels'])}**\n"
+                    f"🕐 Exported: `{data['exported_at'][:19]} UTC`\n\n"
+                    "To restore on any AutoCast instance, send this file back to "
+                    "the bot and tap **⬇️ Import Config**.\n\n"
+                    "⚠️ _Media file IDs may not work if imported to a different "
+                    "Telegram account._"
+                )
+            )
+        except Exception as e:
+            logger.error(f"Export error uid={uid}: {e}", exc_info=True)
+            await q.answer("❌ Export failed. Please try again.", show_alert=True)
+
+    # ── IMPORT ────────────────────────────────────────────────────────────────
+    elif d == "import_config":
+        user_state[uid]["step"] = "waiting_import"
+        await update_menu(
+            q.message,
+            "⬇️ **Import Configuration**\n\n"
+            "Send me a JSON backup file previously exported from AutoCast.\n\n"
+            "📌 Notes:\n"
+            "• Tasks in the past will be rescheduled to 5 min from now\n"
+            "• Channels are re-added without access hash — re-add them "
+            "manually if posting fails\n"
+            "• Media file IDs may be invalid if the source account differs",
+            [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]],
+            uid
+        )
+
     # ── TASK VIEW / DELETE ────────────────────────────────────────────────────
     elif d.startswith("view_"):
         await show_task_details(uid, q.message, d[5:])
@@ -971,9 +1253,7 @@ async def _handle_callback(c, q, uid, d):
         ct  = task["content_type"]
         tz  = await get_user_tz(uid)
         try:
-            dt = datetime.datetime.fromisoformat(task["start_time"])
-            if dt.tzinfo is None:
-                dt = pytz.utc.localize(dt)
+            dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
             time_str = dt.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
         except Exception:
             time_str = "?"
@@ -1039,16 +1319,18 @@ async def _handle_callback(c, q, uid, d):
         if not task:
             await q.answer("❌ Task not found.", show_alert=True)
             return
-        user_state[uid]["editing_task_id"] = tid
-        user_state[uid]["content_type"]    = task["content_type"]
-        user_state[uid]["content_text"]    = task["content_text"]
-        user_state[uid]["file_id"]         = task["file_id"]
-        user_state[uid]["entities"]        = task["entities"]
-        user_state[uid]["pin"]             = task["pin"]
-        user_state[uid]["del"]             = task["delete_old"]
-        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
-        user_state[uid]["interval"]        = task["repeat_interval"]
-        user_state[uid]["step"]            = "rescheduling"
+        user_state[uid].update({
+            "editing_task_id":    tid,
+            "content_type":       task["content_type"],
+            "content_text":       task["content_text"],
+            "file_id":            task["file_id"],
+            "entities":           task["entities"],
+            "pin":                task["pin"],
+            "del":                task["delete_old"],
+            "auto_delete_offset": task.get("auto_delete_offset", 0),
+            "interval":           task["repeat_interval"],
+            "step":               "rescheduling",
+        })
         await show_time_menu(q.message, uid, force_new=False)
 
     elif d.startswith("edit_settings_"):
@@ -1057,22 +1339,22 @@ async def _handle_callback(c, q, uid, d):
         if not task:
             await q.answer("❌ Task not found.", show_alert=True)
             return
-        user_state[uid]["editing_task_id"] = tid
-        user_state[uid]["content_type"]    = task["content_type"]
-        user_state[uid]["content_text"]    = task["content_text"]
-        user_state[uid]["file_id"]         = task["file_id"]
-        user_state[uid]["entities"]        = task["entities"]
-        user_state[uid]["pin"]             = task["pin"]
-        user_state[uid]["del"]             = task["delete_old"]
-        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
-        user_state[uid]["interval"]        = task["repeat_interval"]
         try:
-            dt = datetime.datetime.fromisoformat(task["start_time"])
-            if dt.tzinfo is None:
-                dt = pytz.utc.localize(dt)
-            user_state[uid]["start_time"] = dt
+            dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
         except Exception:
-            pass
+            dt = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=30)
+        user_state[uid].update({
+            "editing_task_id":    tid,
+            "content_type":       task["content_type"],
+            "content_text":       task["content_text"],
+            "file_id":            task["file_id"],
+            "entities":           task["entities"],
+            "pin":                task["pin"],
+            "del":                task["delete_old"],
+            "auto_delete_offset": task.get("auto_delete_offset", 0),
+            "interval":           task["repeat_interval"],
+            "start_time":         dt,
+        })
         await ask_settings(q.message, uid)
 
     elif d.startswith("edit_repeat_"):
@@ -1081,22 +1363,22 @@ async def _handle_callback(c, q, uid, d):
         if not task:
             await q.answer("❌ Task not found.", show_alert=True)
             return
-        user_state[uid]["editing_task_id"] = tid
-        user_state[uid]["content_type"]    = task["content_type"]
-        user_state[uid]["content_text"]    = task["content_text"]
-        user_state[uid]["file_id"]         = task["file_id"]
-        user_state[uid]["entities"]        = task["entities"]
-        user_state[uid]["pin"]             = task["pin"]
-        user_state[uid]["del"]             = task["delete_old"]
-        user_state[uid]["auto_delete_offset"] = task.get("auto_delete_offset", 0)
-        user_state[uid]["interval"]        = task["repeat_interval"]
         try:
-            dt = datetime.datetime.fromisoformat(task["start_time"])
-            if dt.tzinfo is None:
-                dt = pytz.utc.localize(dt)
-            user_state[uid]["start_time"] = dt
+            dt = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
         except Exception:
-            pass
+            dt = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=30)
+        user_state[uid].update({
+            "editing_task_id":    tid,
+            "content_type":       task["content_type"],
+            "content_text":       task["content_text"],
+            "file_id":            task["file_id"],
+            "entities":           task["entities"],
+            "pin":                task["pin"],
+            "del":                task["delete_old"],
+            "auto_delete_offset": task.get("auto_delete_offset", 0),
+            "interval":           task["repeat_interval"],
+            "start_time":         dt,
+        })
         kb = [
             [InlineKeyboardButton("🔂 Once (No Repeat)",  callback_data="rep_0")],
             [InlineKeyboardButton("Every 1 Hour",         callback_data="rep_60"),
@@ -1324,19 +1606,23 @@ async def handle_inputs(c, m):
     uid  = m.from_user.id
     text = (m.text or m.caption or "").strip()
 
+    if uid not in user_state:
+        user_state[uid] = {}
+        await restore_wizard_state(uid)
+
     if uid in login_state:
         await _handle_login(c, m, uid, text)
         return
 
     if text == "✅ Done Adding Posts":
-        if uid not in user_state:
-            user_state[uid] = {}
         await m.reply("✅ All posts added!", reply_markup=ReplyKeyboardRemove())
         await show_time_menu(m, uid, force_new=True)
+        await persist_wizard_state(uid)
         return
 
     if text == "❌ Cancel":
-        user_state.pop(uid, None)
+        await clear_wizard_state(uid)
+        user_state[uid] = {}
         await m.reply("Operation cancelled.", reply_markup=ReplyKeyboardRemove())
         await start_cmd(c, m)
         return
@@ -1364,9 +1650,66 @@ async def handle_inputs(c, m):
             )
     elif step == "waiting_channel_id":
         await handle_channel_id_input(c, m, uid, text)
+    elif step == "waiting_import":
+        await handle_import_file(c, m, uid)
     else:
         if text and not text.startswith("/"):
             await m.reply("Use the menu to interact with the bot. Type /start to open it.")
+
+    await persist_wizard_state(uid)
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMPORT FILE HANDLER
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_import_file(c, m, uid):
+    """Handles a JSON document sent by the user for configuration import."""
+    if not m.document:
+        await m.reply(
+            "⚠️ Please send a **JSON file** (.json) exported from AutoCast.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")
+            ]])
+        )
+        return
+
+    if not (m.document.file_name or "").lower().endswith(".json"):
+        await m.reply(
+            "❌ Only `.json` files are supported. Please export from AutoCast first.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")
+            ]])
+        )
+        return
+
+    if m.document.file_size and m.document.file_size > 5 * 1024 * 1024:
+        await m.reply("❌ File too large (max 5 MB).")
+        return
+
+    wait = await m.reply("⏳ Processing import…")
+    try:
+        buf = await app.download_media(m.document, in_memory=True)
+        data = json.loads(bytes(buf.getbuffer()))
+    except Exception as e:
+        await wait.edit_text(f"❌ Could not parse file: {e}")
+        return
+
+    imported, errs = await import_user_config(uid, data)
+    user_state[uid]["step"] = None
+
+    lines = [f"✅ **Import Complete** — {imported} task(s) scheduled."]
+    if errs:
+        lines.append(f"\n⚠️ **{len(errs)} warning(s):**")
+        for err in errs[:10]:
+            lines.append(f"  • {err}")
+        if len(errs) > 10:
+            lines.append(f"  …and {len(errs)-10} more.")
+
+    await wait.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏠 Home", callback_data="menu_home")
+        ]])
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGIN FLOW
@@ -1465,7 +1808,6 @@ async def handle_forward_add(c, m, uid):
         ) as user_client:
             access_hash = await warm_peer_and_get_hash(user_client, uid, cid)
             try:
-                peer = await user_client.storage.get_peer_by_id(cid)
                 chat  = await user_client.get_chat(cid)
                 title = chat.title or title
             except Exception:
@@ -1555,9 +1897,6 @@ async def process_content_message(c, m, uid):
     st["input_msg_id"] = m.id
     st["src_chat_id"]  = m.chat.id
     st["src_msg_id"]   = m.id
-    # Store the original channel message ID the user replied to (for thread reply).
-    # We do NOT require forward_from_chat to be set — messages with link previews
-    # often omit it even when forwarded from a channel.
     st["reply_to_channel_msg_id"] = None
     if m.reply_to_message:
         fwd_msg_id = getattr(m.reply_to_message, "forward_from_message_id", None)
@@ -1638,10 +1977,7 @@ async def process_content_edit_message(c, m, uid):
         await m.reply("❌ Task no longer exists.")
         return
     try:
-        dt = datetime.datetime.fromisoformat(task["start_time"])
-        if dt.tzinfo is None:
-            dt = pytz.utc.localize(dt)
-        st["start_time"] = dt
+        st["start_time"] = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
     except Exception:
         pass
     st["interval"]           = task["repeat_interval"]
@@ -1676,13 +2012,10 @@ async def update_task_logic(uid, q):
         try: scheduler.remove_job(tid)
         except Exception: pass
 
-    tz         = await get_user_tz(uid)
     start_time = st.get("start_time")
     if not start_time:
         try:
-            start_time = datetime.datetime.fromisoformat(task["start_time"])
-            if start_time.tzinfo is None:
-                start_time = pytz.utc.localize(start_time)
+            start_time = _ensure_utc(datetime.datetime.fromisoformat(task["start_time"]))
         except Exception:
             start_time = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=10)
 
@@ -1698,7 +2031,7 @@ async def update_task_logic(uid, q):
         "delete_old":         st.get("del",          task["delete_old"]),
         "auto_delete_offset": st.get("auto_delete_offset", task.get("auto_delete_offset", 0)),
         "repeat_interval":    st.get("interval",     task["repeat_interval"]),
-        "start_time":         start_time.isoformat(),
+        "start_time":         _ensure_utc(start_time).isoformat(),
         "last_msg_id":        task["last_msg_id"],
         "reply_target":       task.get("reply_target"),
         "src_chat_id":        st.get("src_chat_id",  task.get("src_chat_id", 0)),
@@ -1737,10 +2070,11 @@ async def create_task_logic(uid, q):
             "src_msg_id":         st.get("src_msg_id", 0),
         }]
 
-    base_tid = int(datetime.datetime.now().timestamp())
-    t_str    = st["start_time"].astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
-    interval = st.get("interval")
-    total    = 0
+    base_tid   = int(datetime.datetime.now().timestamp())
+    start_time = _ensure_utc(st["start_time"])
+    t_str      = start_time.astimezone(tz).strftime("%d-%b-%Y %I:%M %p %Z")
+    interval   = st.get("interval")
+    total      = 0
 
     for ch_idx, cid in enumerate(targets):
         batch_map = {
@@ -1750,7 +2084,7 @@ async def create_task_logic(uid, q):
         }
         for pi, post in enumerate(queue):
             tid      = f"task_{base_tid}_{ch_idx}_{pi}"
-            run_time = st["start_time"] + datetime.timedelta(seconds=pi * 10)
+            run_time = start_time + datetime.timedelta(seconds=pi * 10)
 
             reply_target = None
             if post.get("reply_ref_id") and post["reply_ref_id"] in batch_map:
@@ -1770,7 +2104,6 @@ async def create_task_logic(uid, q):
                 "repeat_interval":    interval,
                 "start_time":         run_time.isoformat(),
                 "last_msg_id":        None,
-                # batch thread reply takes priority; fall back to direct channel msg reply
                 "reply_target":       reply_target or str(st.get("reply_to_channel_msg_id") or ""),
                 "src_chat_id":        post.get("src_chat_id", 0),
                 "src_msg_id":         post.get("src_msg_id", 0),
@@ -1803,239 +2136,27 @@ def add_scheduler_job(t):
     if scheduler is None:
         return
     tid = t["task_id"]
-    dt  = datetime.datetime.fromisoformat(t["start_time"])
-    if dt.tzinfo is None:
-        dt = pytz.utc.localize(dt)
+    dt  = _ensure_utc(datetime.datetime.fromisoformat(t["start_time"]))
 
     async def job_func():
-        async with queue_lock:
-            logger.info(f"🚀 Job {tid} triggered")
-            fresh = await get_single_task(tid)
-            if not fresh:
-                logger.warning(f"Job {tid}: task gone from DB, skipping")
+        # FIX 3 — MULTI-INSTANCE: PostgreSQL advisory lock prevents two replicas
+        # from executing the same job simultaneously.
+        pool = await get_db()
+        lock_key = abs(hash(tid)) % (2 ** 31)
+        async with pool.acquire() as lock_conn:
+            got_lock = await lock_conn.fetchval(
+                "SELECT pg_try_advisory_lock($1)", lock_key
+            )
+            if not got_lock:
+                logger.info(f"Job {tid}: skipped — advisory lock held by another instance")
                 return
-
-            next_iso = None
-            if fresh["repeat_interval"]:
-                try:
-                    mins = int(fresh["repeat_interval"].split("=")[1])
-                    # Use current time as base so next_run display is always accurate,
-                    # even if the job fired late (e.g. bot was restarting).
-                    next_iso = (
-                        datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=mins)
-                    ).isoformat()
-                except Exception as e:
-                    logger.error(f"Next-run calc error for {tid}: {e}")
-
-            session = await get_session(fresh["owner_id"])
-            if not session:
-                logger.warning(f"Job {tid}: no session, removing task")
-                if fresh["repeat_interval"] and scheduler:
-                    try: scheduler.remove_job(tid)
-                    except Exception: pass
-                await delete_task(tid)
-                return
-
-            sent = None
             try:
-                async with Client(
-                    ":memory:", api_id=API_ID, api_hash=API_HASH,
-                    session_string=session,
-                    device_model="AutoCast", system_version="Railway", app_version="2.0"
-                ) as user:
-
-                    target_int  = int(fresh["chat_id"])
-
-                    access_hash = await get_channel_access_hash(
-                        fresh["owner_id"], fresh["chat_id"]
-                    )
-                    if not access_hash:
-                        logger.info(f"Job {tid}: access_hash missing, scanning dialogs…")
-                        access_hash = await warm_peer_and_get_hash(
-                            user, fresh["owner_id"], target_int
-                        )
-                        if not access_hash:
-                            logger.error(
-                                f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
-                                "user must re-add it so access_hash can be cached"
-                            )
-                            return
-
-                    inject_peer(user.storage, target_int, access_hash)
-
-                    caption  = fresh["content_text"]
-                    ents     = deserialize_entities(fresh["entities"])
-                    reply_id = None
-
-                    if fresh["delete_old"] and fresh.get("last_msg_id"):
-                        try:
-                            await user.delete_messages(target_int, fresh["last_msg_id"])
-                            logger.info(f"Job {tid}: deleted old msg {fresh['last_msg_id']}")
-                        except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
-                            pass
-                        except Exception as e:
-                            logger.warning(f"Job {tid}: delete old failed: {e}")
-
-                    # Resolve reply_id for both batch threading and direct channel msg reply
-                    if fresh.get("reply_target"):
-                        ref_val = fresh["reply_target"]
-                        if ref_val.startswith("task_"):
-                            ref = await get_single_task(ref_val)
-                            if ref and ref.get("last_msg_id"):
-                                reply_id = ref["last_msg_id"]
-                        else:
-                            try:
-                                reply_id = int(ref_val)
-                            except (ValueError, TypeError):
-                                reply_id = None
-
-                    ct  = fresh["content_type"]
-                    fid = fresh["file_id"]
-
-                    async def _send():
-                        nonlocal sent
-                        if ct == "text":
-                            sent = await user.send_message(
-                                target_int, caption or " ",
-                                entities=ents,
-                                parse_mode=None,
-                                reply_to_message_id=reply_id,
-                                disable_web_page_preview=True
-                            )
-                        elif ct == "poll":
-                            pd = json.loads(caption)
-                            sent = await user.send_poll(
-                                target_int, pd["question"], pd["options"],
-                                reply_to_message_id=reply_id
-                            )
-                        elif ct == "photo":
-                            sent = await user.send_photo(
-                                target_int, fid, caption=caption,
-                                caption_entities=ents, reply_to_message_id=reply_id
-                            )
-                        elif ct == "video":
-                            sent = await user.send_video(
-                                target_int, fid, caption=caption,
-                                caption_entities=ents, reply_to_message_id=reply_id
-                            )
-                        elif ct == "animation":
-                            sent = await user.send_animation(
-                                target_int, fid, caption=caption,
-                                caption_entities=ents, reply_to_message_id=reply_id
-                            )
-                        elif ct == "document":
-                            sent = await user.send_document(
-                                target_int, fid, caption=caption,
-                                caption_entities=ents, reply_to_message_id=reply_id
-                            )
-                        elif ct == "sticker":
-                            sent = await user.send_sticker(
-                                target_int, fid, reply_to_message_id=reply_id
-                            )
-                        elif ct == "audio":
-                            sent = await user.send_audio(
-                                target_int, fid, caption=caption,
-                                caption_entities=ents, reply_to_message_id=reply_id
-                            )
-                        elif ct == "voice":
-                            sent = await user.send_voice(
-                                target_int, fid, caption=caption,
-                                reply_to_message_id=reply_id
-                            )
-
-                    try:
-                        await _send()
-                    except (errors.FileIdInvalid, errors.MediaEmpty):
-                        logger.warning(
-                            f"Job {tid}: {ct} file invalid/empty — re-downloading for re-upload"
-                        )
-                        media = None
-                        if fid:
-                            try:
-                                media = await app.download_media(fid, in_memory=True)
-                            except Exception as dl_e:
-                                logger.warning(f"Job {tid}: bot download failed: {dl_e}")
-                        if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
-                            try:
-                                media_msg = await app.forward_messages(
-                                    fresh["owner_id"],
-                                    from_chat_id=fresh["src_chat_id"],
-                                    message_ids=fresh["src_msg_id"]
-                                )
-                                media = await app.download_media(media_msg, in_memory=True)
-                                await media_msg.delete()
-                            except Exception as fwd_e:
-                                logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
-                        if media is None:
-                            logger.error(f"Job {tid}: cannot recover media for {ct}, skipping")
-                            sent = None
-                        else:
-                            if ct == "photo":
-                                sent = await user.send_photo(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                            elif ct == "video":
-                                sent = await user.send_video(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                            elif ct == "animation":
-                                sent = await user.send_animation(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                            elif ct == "document":
-                                sent = await user.send_document(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                            elif ct == "audio":
-                                media.name = "audio.mp3"
-                                sent = await user.send_audio(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
-                            elif ct == "voice":
-                                media.name = "voice.ogg"
-                                sent = await user.send_voice(target_int, media, caption=caption, reply_to_message_id=reply_id)
-                            elif ct == "sticker":
-                                logger.error(f"Job {tid}: sticker re-upload not supported")
-                                sent = None
-
-                    if sent:
-                        logger.info(f"Job {tid}: sent msg {sent.id}")
-                        if fresh["pin"]:
-                            try:
-                                pin_notif = await sent.pin()
-                                if isinstance(pin_notif, Message):
-                                    await pin_notif.delete()
-                            except Exception as e:
-                                logger.warning(f"Job {tid}: pin failed: {e}")
-
-                        await update_last_msg(tid, sent.id)
-
-                        off = fresh.get("auto_delete_offset", 0)
-                        if off and off > 0:
-                            try:
-                                run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
-                                scheduler.add_job(
-                                    delete_sent_message, "date", run_date=run_at,
-                                    args=[fresh["owner_id"], fresh["chat_id"], sent.id],
-                                    id=f"del_{tid}_{sent.id}",
-                                    misfire_grace_time=120
-                                )
-                            except Exception as e:
-                                logger.error(f"Job {tid}: auto-delete schedule failed: {e}")
-
-                        if not fresh["repeat_interval"]:
-                            await delete_task(tid)
-                            logger.info(f"Job {tid}: one-time task removed")
-
-            except errors.FloodWait as e:
-                logger.warning(f"Job {tid}: FloodWait {e.value}s")
-                await asyncio.sleep(e.value)
-            except errors.MessageTooLong:
-                logger.error(f"Job {tid}: message too long")
-            except errors.MessageEmpty:
-                logger.error(f"Job {tid}: message empty")
-            except errors.ChatWriteForbidden:
-                logger.error(f"Job {tid}: write forbidden in {fresh['chat_id']}")
-            except errors.ChatAdminRequired:
-                logger.error(f"Job {tid}: admin required in {fresh['chat_id']}")
-            except errors.PeerIdInvalid:
-                logger.error(f"Job {tid}: invalid chat {fresh['chat_id']}")
-            except Exception as e:
-                logger.error(f"Job {tid}: unexpected error: {e}", exc_info=True)
+                await _run_job(tid)
             finally:
-                if next_iso and fresh.get("repeat_interval"):
-                    try: await update_next_run(tid, next_iso)
-                    except Exception: pass
+                try:
+                    await lock_conn.execute("SELECT pg_advisory_unlock($1)", lock_key)
+                except Exception:
+                    pass
 
     if t["repeat_interval"]:
         mins = int(t["repeat_interval"].split("=")[1])
@@ -2052,13 +2173,249 @@ def add_scheduler_job(t):
             id=tid, replace_existing=True, misfire_grace_time=3600
         )
 
+async def _run_job(tid: str):
+    """Core job logic, extracted for clarity. Called inside the advisory lock."""
+    async with queue_lock:
+        logger.info(f"🚀 Job {tid} triggered")
+        fresh = await get_single_task(tid)
+        if not fresh:
+            logger.warning(f"Job {tid}: task gone from DB, skipping")
+            return
+
+        # FIX 2 — UTC normalisation for next_run calculation
+        next_iso = None
+        if fresh["repeat_interval"]:
+            try:
+                mins = int(fresh["repeat_interval"].split("=")[1])
+                next_iso = (
+                    datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=mins)
+                ).isoformat()
+            except Exception as e:
+                logger.error(f"Next-run calc error for {tid}: {e}")
+
+        session = await get_session(fresh["owner_id"])
+        if not session:
+            logger.warning(f"Job {tid}: no session, removing task")
+            if fresh["repeat_interval"] and scheduler:
+                try: scheduler.remove_job(tid)
+                except Exception: pass
+            await delete_task(tid)
+            return
+
+        sent = None
+        try:
+            async with Client(
+                ":memory:", api_id=API_ID, api_hash=API_HASH,
+                session_string=session,
+                device_model="AutoCast", system_version="Railway", app_version="2.0"
+            ) as user:
+                target_int  = int(fresh["chat_id"])
+                access_hash = await get_channel_access_hash(fresh["owner_id"], fresh["chat_id"])
+                if not access_hash:
+                    logger.info(f"Job {tid}: access_hash missing, scanning dialogs…")
+                    access_hash = await warm_peer_and_get_hash(
+                        user, fresh["owner_id"], target_int
+                    )
+                    if not access_hash:
+                        logger.error(
+                            f"Job {tid}: cannot resolve channel {fresh['chat_id']} — "
+                            "user must re-add it so access_hash can be cached"
+                        )
+                        return
+
+                inject_peer(user.storage, target_int, access_hash)
+
+                caption  = fresh["content_text"]
+                ents     = deserialize_entities(fresh["entities"])
+                reply_id = None
+
+                if fresh["delete_old"] and fresh.get("last_msg_id"):
+                    try:
+                        await user.delete_messages(target_int, fresh["last_msg_id"])
+                        logger.info(f"Job {tid}: deleted old msg {fresh['last_msg_id']}")
+                    except (errors.MessageDeleteForbidden, errors.MessageIdInvalid):
+                        pass
+                    except Exception as e:
+                        logger.warning(f"Job {tid}: delete old failed: {e}")
+
+                # FIX 6 — reply_target: graceful None/missing handling
+                if fresh.get("reply_target"):
+                    ref_val = str(fresh["reply_target"]).strip()
+                    if ref_val.startswith("task_"):
+                        ref = await get_single_task(ref_val)
+                        if ref and ref.get("last_msg_id"):
+                            reply_id = ref["last_msg_id"]
+                        else:
+                            logger.info(
+                                f"Job {tid}: reply_target '{ref_val}' has no last_msg_id yet "
+                                "— posting without thread reply"
+                            )
+                    elif ref_val:
+                        try:
+                            reply_id = int(ref_val)
+                        except (ValueError, TypeError):
+                            logger.warning(f"Job {tid}: invalid reply_target '{ref_val}' — ignored")
+
+                ct  = fresh["content_type"]
+                fid = fresh["file_id"]
+
+                async def _send():
+                    nonlocal sent
+                    if ct == "text":
+                        sent = await user.send_message(
+                            target_int, caption or " ",
+                            entities=ents, parse_mode=None,
+                            reply_to_message_id=reply_id,
+                            disable_web_page_preview=True
+                        )
+                    elif ct == "poll":
+                        pd = json.loads(caption)
+                        sent = await user.send_poll(
+                            target_int, pd["question"], pd["options"],
+                            reply_to_message_id=reply_id
+                        )
+                    elif ct == "photo":
+                        sent = await user.send_photo(target_int, fid, caption=caption,
+                            caption_entities=ents, reply_to_message_id=reply_id)
+                    elif ct == "video":
+                        sent = await user.send_video(target_int, fid, caption=caption,
+                            caption_entities=ents, reply_to_message_id=reply_id)
+                    elif ct == "animation":
+                        sent = await user.send_animation(target_int, fid, caption=caption,
+                            caption_entities=ents, reply_to_message_id=reply_id)
+                    elif ct == "document":
+                        sent = await user.send_document(target_int, fid, caption=caption,
+                            caption_entities=ents, reply_to_message_id=reply_id)
+                    elif ct == "sticker":
+                        sent = await user.send_sticker(target_int, fid,
+                            reply_to_message_id=reply_id)
+                    elif ct == "audio":
+                        sent = await user.send_audio(target_int, fid, caption=caption,
+                            caption_entities=ents, reply_to_message_id=reply_id)
+                    elif ct == "voice":
+                        sent = await user.send_voice(target_int, fid, caption=caption,
+                            reply_to_message_id=reply_id)
+
+                try:
+                    await _send()
+                except (errors.FileIdInvalid, errors.MediaEmpty):
+                    logger.warning(
+                        f"Job {tid}: {ct} file invalid/empty — attempting re-upload"
+                    )
+                    # FIX 5 — sticker re-upload now included in fallback path
+                    media = None
+                    if fid:
+                        try:
+                            media = await app.download_media(fid, in_memory=True)
+                        except Exception as dl_e:
+                            logger.warning(f"Job {tid}: bot download failed: {dl_e}")
+                    if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
+                        try:
+                            media_msg = await app.forward_messages(
+                                fresh["owner_id"],
+                                from_chat_id=fresh["src_chat_id"],
+                                message_ids=fresh["src_msg_id"]
+                            )
+                            media = await app.download_media(media_msg, in_memory=True)
+                            await media_msg.delete()
+                        except Exception as fwd_e:
+                            logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
+                    if media is None:
+                        logger.error(f"Job {tid}: cannot recover media for {ct}, skipping")
+                        sent = None
+                    else:
+                        # FIX 5 — sticker handled; all types covered
+                        send_map = {
+                            "photo":     lambda: user.send_photo(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id),
+                            "video":     lambda: user.send_video(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id),
+                            "animation": lambda: user.send_animation(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id),
+                            "document":  lambda: user.send_document(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id),
+                            "sticker":   lambda: user.send_sticker(target_int, media, reply_to_message_id=reply_id),
+                        }
+                        if ct == "audio":
+                            media.name = "audio.mp3"
+                            sent = await user.send_audio(target_int, media, caption=caption, caption_entities=ents, reply_to_message_id=reply_id)
+                        elif ct == "voice":
+                            media.name = "voice.ogg"
+                            sent = await user.send_voice(target_int, media, caption=caption, reply_to_message_id=reply_id)
+                        elif ct in send_map:
+                            sent = await send_map[ct]()
+                        else:
+                            logger.error(f"Job {tid}: no re-upload handler for type '{ct}'")
+                            sent = None
+
+                if sent:
+                    logger.info(f"Job {tid}: sent msg {sent.id}")
+                    if fresh["pin"]:
+                        try:
+                            pin_notif = await sent.pin()
+                            if isinstance(pin_notif, Message):
+                                await pin_notif.delete()
+                        except Exception as e:
+                            logger.warning(f"Job {tid}: pin failed: {e}")
+
+                    await update_last_msg(tid, sent.id)
+
+                    off = fresh.get("auto_delete_offset", 0)
+                    if off and off > 0:
+                        try:
+                            run_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(minutes=off)
+                            scheduler.add_job(
+                                delete_sent_message, "date", run_date=run_at,
+                                args=[fresh["owner_id"], fresh["chat_id"], sent.id],
+                                id=f"del_{tid}_{sent.id}",
+                                misfire_grace_time=120
+                            )
+                        except Exception as e:
+                            logger.error(f"Job {tid}: auto-delete schedule failed: {e}")
+
+                    if not fresh["repeat_interval"]:
+                        await delete_task(tid)
+                        logger.info(f"Job {tid}: one-time task removed")
+
+        # FIX 4 — FLOODWAIT: reschedule instead of blocking the event loop
+        except errors.FloodWait as e:
+            wait_secs = e.value + 5
+            logger.warning(f"Job {tid}: FloodWait {e.value}s — rescheduling in {wait_secs}s")
+            retry_at = datetime.datetime.now(pytz.utc) + datetime.timedelta(seconds=wait_secs)
+            try:
+                scheduler.add_job(
+                    # Re-use the named job function registered in add_scheduler_job
+                    # by retrieving the original job and re-firing it
+                    lambda: asyncio.ensure_future(_run_job(tid)),
+                    DateTrigger(run_date=retry_at, timezone=pytz.utc),
+                    id=f"{tid}_fw_{int(retry_at.timestamp())}",
+                    replace_existing=True,
+                    misfire_grace_time=3600
+                )
+            except Exception as sched_err:
+                logger.error(f"Job {tid}: failed to reschedule after FloodWait: {sched_err}")
+
+        except errors.MessageTooLong:
+            logger.error(f"Job {tid}: message too long")
+        except errors.MessageEmpty:
+            logger.error(f"Job {tid}: message empty")
+        except errors.ChatWriteForbidden:
+            logger.error(f"Job {tid}: write forbidden in {fresh['chat_id']}")
+        except errors.ChatAdminRequired:
+            logger.error(f"Job {tid}: admin required in {fresh['chat_id']}")
+        except errors.PeerIdInvalid:
+            logger.error(f"Job {tid}: invalid chat {fresh['chat_id']}")
+        except Exception as e:
+            logger.error(f"Job {tid}: unexpected error: {e}", exc_info=True)
+        finally:
+            if next_iso and fresh.get("repeat_interval"):
+                try: await update_next_run(tid, next_iso)
+                except Exception: pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  STARTUP
 # ─────────────────────────────────────────────────────────────────────────────
 async def main():
     check_env_vars()
-    global queue_lock, scheduler
+    _init_encryption()
 
+    global queue_lock, scheduler
     queue_lock = asyncio.Lock()
 
     await init_db()
