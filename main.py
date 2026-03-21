@@ -242,7 +242,8 @@ async def init_db():
                 auto_delete_offset INTEGER DEFAULT 0,
                 reply_target       TEXT,
                 src_chat_id        BIGINT DEFAULT 0,
-                src_msg_id         BIGINT DEFAULT 0
+                src_msg_id         BIGINT DEFAULT 0,
+                is_paused          BOOLEAN DEFAULT FALSE
             );
         """)
         # FIX 3 — MULTI-INSTANCE: persist wizard state so any replica can resume
@@ -258,7 +259,9 @@ async def init_db():
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS src_chat_id BIGINT DEFAULT 0",
             "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS src_msg_id  BIGINT DEFAULT 0",
-            "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS timezone TEXT DEFAULT 'UTC'",
+            "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS is_paused   BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS timezone      TEXT    DEFAULT 'UTC'",
+            "ALTER TABLE userbot_settings  ADD COLUMN IF NOT EXISTS engine_paused BOOLEAN DEFAULT FALSE",
             "ALTER TABLE userbot_channels  ADD COLUMN IF NOT EXISTS access_hash BIGINT DEFAULT 0",
         ]:
             try:
@@ -560,6 +563,33 @@ async def update_next_run(task_id, iso_str):
         "UPDATE userbot_tasks_v11 SET start_time=$1 WHERE task_id=$2",
         iso_str, task_id
     )
+
+async def set_task_paused(task_id: str, paused: bool):
+    pool = await get_db()
+    await pool.execute(
+        "UPDATE userbot_tasks_v11 SET is_paused=$1 WHERE task_id=$2", paused, task_id
+    )
+
+async def set_all_tasks_paused(owner_id: int, paused: bool):
+    pool = await get_db()
+    await pool.execute(
+        "UPDATE userbot_tasks_v11 SET is_paused=$1 WHERE owner_id=$2", paused, owner_id
+    )
+
+async def get_engine_paused(owner_id: int) -> bool:
+    pool = await get_db()
+    row = await pool.fetchrow(
+        "SELECT engine_paused FROM userbot_settings WHERE user_id=$1", owner_id
+    )
+    return bool(row["engine_paused"]) if row and row["engine_paused"] is not None else False
+
+async def set_engine_paused(owner_id: int, paused: bool):
+    pool = await get_db()
+    await pool.execute("""
+        INSERT INTO userbot_settings (user_id, engine_paused)
+        VALUES ($1, $2)
+        ON CONFLICT (user_id) DO UPDATE SET engine_paused = $2
+    """, owner_id, paused)
 
 async def delete_all_user_data(user_id):
     pool = await get_db()
@@ -1004,6 +1034,13 @@ async def update_menu(m, text, kb, uid, force_new=False):
 async def show_main_menu(m, uid, force_new=False):
     tz = await get_user_tz(uid)
     tz_label = str(tz).replace("_", " ")
+    engine_off = await get_engine_paused(uid)
+    engine_btn = (
+        InlineKeyboardButton("▶️ Start Engine", callback_data="engine_start")
+        if engine_off else
+        InlineKeyboardButton("🛑 Stop Engine",  callback_data="engine_stop")
+    )
+    status_line = "⚠️ **Engine is STOPPED** — all scheduled posts are paused." if engine_off else ""
     kb = [
         [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")],
         [InlineKeyboardButton("📢 My Channels",             callback_data="list_channels")],
@@ -1012,15 +1049,16 @@ async def show_main_menu(m, uid, force_new=False):
         [InlineKeyboardButton(f"🌐 Timezone: {tz_label}",   callback_data="tz_select")],
         [InlineKeyboardButton("⬆️ Export Config",           callback_data="export_config"),
          InlineKeyboardButton("⬇️ Import Config",           callback_data="import_config")],
+        [engine_btn],
         [InlineKeyboardButton("🚪 Logout",                  callback_data="logout")],
     ]
-    await update_menu(
-        m,
+    body = (
         "👋 **Welcome to AutoCast | Channel Manager!**\n\n"
-        "Your central hub for managing scheduled posts across your Telegram channels.\n"
-        "Select an option below to get started.",
-        kb, uid, force_new
+        "Your central hub for managing scheduled posts across your Telegram channels."
     )
+    if status_line:
+        body += "\n\n" + status_line
+    await update_menu(m, body, kb, uid, force_new)
 
 async def show_channels(uid, m, force_new=False):
     chs = await get_channels(uid)
@@ -1188,8 +1226,10 @@ async def list_active_tasks(uid, m, cid, force_new=False):
     icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
     kb = []
     for t in tasks:
-        snippet = (t["content_text"] or "Media")[:15] + "…"
-        icon    = icons.get(t["content_type"], "📁")
+        snippet  = (t["content_text"] or "Media")[:15] + "…"
+        icon     = icons.get(t["content_type"], "📁")
+        if t.get("is_paused"):
+            icon = "⏸"  # override with pause indicator
         try:
             dt = _ensure_utc(datetime.datetime.fromisoformat(t["start_time"]))
             time_str = dt.astimezone(tz).strftime("%I:%M %p")
@@ -1223,6 +1263,13 @@ async def show_task_details(uid, m, tid):
         "voice": "🎙 Voice", "document": "📁 File", "animation": "🎞 GIF"
     }
     type_str = type_map.get(t["content_type"], "📁 File")
+    is_paused = bool(t.get("is_paused", False))
+    pause_btn = (
+        InlineKeyboardButton("▶️ Resume Task", callback_data=f"task_resume_{tid}")
+        if is_paused else
+        InlineKeyboardButton("⏸ Pause Task",  callback_data=f"task_pause_{tid}")
+    )
+    paused_line = "\n⏸ **Status: PAUSED** — this task will not fire until resumed." if is_paused else ""
     txt = (
         f"⚙️ **Task Details**\n\n"
         f"📂 **Type:** {type_str}\n"
@@ -1233,6 +1280,7 @@ async def show_task_details(uid, m, tid):
         f"🗑 **Del Old:** {'✅' if t['delete_old'] else '❌'} | "
         f"⏰ **Auto-Delete:** "
         f"{str(t.get('auto_delete_offset') or 0)+'m' if t.get('auto_delete_offset') else 'OFF'}"
+        f"{paused_line}"
     )
     kb = [
         [InlineKeyboardButton("👁 View Post",     callback_data=f"prev_{tid}"),
@@ -1240,7 +1288,8 @@ async def show_task_details(uid, m, tid):
         [InlineKeyboardButton("🗓 Reschedule",    callback_data=f"reschedule_{tid}"),
          InlineKeyboardButton("🔁 Repetition",   callback_data=f"edit_repeat_{tid}")],
         [InlineKeyboardButton("⚙️ Settings",     callback_data=f"edit_settings_{tid}")],
-        [InlineKeyboardButton("🗑 Delete Task",   callback_data=f"del_task_{tid}")],
+        [pause_btn,
+         InlineKeyboardButton("🗑 Delete Task",  callback_data=f"del_task_{tid}")],
         [InlineKeyboardButton("🔙 Back to List",  callback_data=f"back_list_{t['chat_id']}")],
     ]
     await update_menu(m, txt, kb, uid)
@@ -1498,6 +1547,62 @@ async def _handle_callback(c, q, uid, d):
         )
 
     # ── TASK VIEW / DELETE ────────────────────────────────────────────────────
+    elif d.startswith("task_pause_"):
+        tid = d[11:]
+        await set_task_paused(tid, True)
+        if scheduler:
+            try: scheduler.pause_job(tid)
+            except Exception: pass
+        await show_task_details(uid, q.message, tid)
+
+    elif d.startswith("task_resume_"):
+        tid = d[12:]
+        await set_task_paused(tid, False)
+        if scheduler:
+            try: scheduler.resume_job(tid)
+            except Exception: pass
+        await show_task_details(uid, q.message, tid)
+
+    elif d == "engine_stop":
+        kb = [
+            [InlineKeyboardButton("🛑 Yes, Stop All Posts", callback_data="engine_stop_confirm")],
+            [InlineKeyboardButton("🔙 Cancel",               callback_data="menu_home")],
+        ]
+        await update_menu(
+            q.message,
+            "🛑 **Stop Engine?**\n\n"
+            "This will pause **all** your scheduled tasks. "
+            "No posts will be sent until you start the engine again.\n\n"
+            "Your tasks and channels are kept — nothing is deleted.",
+            kb, uid
+        )
+
+    elif d == "engine_stop_confirm":
+        await set_engine_paused(uid, True)
+        await set_all_tasks_paused(uid, True)
+        if scheduler:
+            pool = await get_db()
+            tids = await pool.fetch(
+                "SELECT task_id FROM userbot_tasks_v11 WHERE owner_id=$1", uid
+            )
+            for row in tids:
+                try: scheduler.pause_job(row["task_id"])
+                except Exception: pass
+        await show_main_menu(q.message, uid)
+
+    elif d == "engine_start":
+        await set_engine_paused(uid, False)
+        await set_all_tasks_paused(uid, False)
+        if scheduler:
+            pool = await get_db()
+            tids = await pool.fetch(
+                "SELECT task_id FROM userbot_tasks_v11 WHERE owner_id=$1", uid
+            )
+            for row in tids:
+                try: scheduler.resume_job(row["task_id"])
+                except Exception: pass
+        await show_main_menu(q.message, uid)
+
     elif d.startswith("view_"):
         await show_task_details(uid, q.message, d[5:])
 
@@ -2498,6 +2603,13 @@ def add_scheduler_job(t):
             id=tid, replace_existing=True, misfire_grace_time=3600
         )
 
+    # Restore paused state if the task was paused before a restart
+    if t.get("is_paused"):
+        try:
+            scheduler.pause_job(tid)
+        except Exception:
+            pass
+
 async def _run_job(tid: str):
     """Core job logic, extracted for clarity. Called inside the advisory lock."""
     global queue_lock
@@ -2508,6 +2620,11 @@ async def _run_job(tid: str):
         fresh = await get_single_task(tid)
         if not fresh:
             logger.warning(f"Job {tid}: task gone from DB, skipping")
+            return
+
+        # Skip if task is individually paused or engine is paused for this user
+        if fresh.get("is_paused") or await get_engine_paused(fresh["owner_id"]):
+            logger.info(f"Job {tid}: skipped (paused)")
             return
 
         # FIX 2 — UTC normalisation for next_run calculation
