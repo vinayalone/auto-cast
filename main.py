@@ -829,6 +829,31 @@ def _next_future_run(original_iso: str, interval_str: str | None,
         return now_utc + datetime.timedelta(minutes=5)
 
 
+def _extract_media_file_id(msg, content_type: str) -> str | None:
+    """
+    Given a fetched Pyrogram Message and a content_type string, return the
+    file_id of the media attachment (which is always fresh / never expired).
+    Returns None if the message is empty or the media type doesn't match.
+    """
+    if not msg:
+        return None
+    attr_map = {
+        "photo":     "photo",
+        "video":     "video",
+        "animation": "animation",
+        "document":  "document",
+        "audio":     "audio",
+        "voice":     "voice",
+        "sticker":   "sticker",
+    }
+    attr = attr_map.get(content_type)
+    if attr:
+        media = getattr(msg, attr, None)
+        if media:
+            return getattr(media, "file_id", None)
+    return None
+
+
 async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
     """
     FIX 19 / FIX 24: Download media for export without ever silently skipping.
@@ -854,6 +879,10 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
                     return raw
                 logger.warning(f"Media {fid_short} too large to embed ({len(raw)} bytes) — omitting bytes")
                 return None
+        except errors.FileReferenceExpired:
+            # Stale file reference — caller must refresh via source message
+            logger.warning(f"Media {fid_short}: FILE_REFERENCE_EXPIRED on user client — caller should prefetch source msg")
+            return None
         except asyncio.TimeoutError:
             logger.warning(f"Media {fid_short}: user-client download timed out — falling back to bot client")
         except Exception as e:
@@ -875,6 +904,10 @@ async def _download_media_bytes(file_id: str, user_client=None) -> bytes | None:
                     return raw
                 logger.warning(f"Media {fid_short} too large to embed ({len(raw)} bytes) — omitting bytes")
                 return None
+        except errors.FileReferenceExpired:
+            # No point retrying — the reference is expired regardless of connection
+            logger.warning(f"Media {fid_short}: FILE_REFERENCE_EXPIRED on bot client — no further retries")
+            return None
         except asyncio.TimeoutError:
             logger.warning(f"Media {fid_short}: bot-client download timed out (attempt {attempt}/3)")
         except Exception as e:
@@ -1020,9 +1053,39 @@ async def export_user_config(uid: int) -> dict:
                     "media_bytes":        None,
                 }
                 if t["content_type"] not in ("text", "poll") and t.get("file_id"):
+                    download_fid = t["file_id"]
+
+                    # ── FIX 25: Refresh expired file reference via source message ──
+                    # Telegram file references expire.  Stored file_id values can be
+                    # months old, making them stale on export.  Prefetching the source
+                    # message gives us a guaranteed-fresh file_id and avoids the storm
+                    # of Pyrogram reconnects that FILE_REFERENCE_EXPIRED triggers.
+                    src_cid = t.get("src_chat_id") or 0
+                    src_mid = t.get("src_msg_id") or 0
+                    if src_cid and src_mid and export_user_client:
+                        try:
+                            src_msg = await asyncio.wait_for(
+                                export_user_client.get_messages(int(src_cid), int(src_mid)),
+                                timeout=15.0,
+                            )
+                            fresh_fid = _extract_media_file_id(src_msg, t["content_type"])
+                            if fresh_fid:
+                                download_fid = fresh_fid
+                                logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: refreshed file_id from src msg {src_cid}/{src_mid}")
+                        except Exception as ref_err:
+                            logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: could not prefetch src msg ({ref_err}), using stored file_id")
+
                     raw = await _download_media_bytes(
-                        t["file_id"], user_client=export_user_client
+                        download_fid, user_client=export_user_client
                     )
+
+                    # Last-resort: if fresh-fid download also failed, try the raw stored fid
+                    if raw is None and download_fid != t["file_id"]:
+                        logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: fresh fid failed, retrying with stored fid")
+                        raw = await _download_media_bytes(
+                            t["file_id"], user_client=export_user_client
+                        )
+
                     if raw:
                         entry["media_bytes"] = base64.b64encode(raw).decode()
             except Exception as task_err:
