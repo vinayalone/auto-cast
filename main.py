@@ -1062,6 +1062,7 @@ async def export_user_config(uid: int) -> dict:
                     # of Pyrogram reconnects that FILE_REFERENCE_EXPIRED triggers.
                     src_cid = t.get("src_chat_id") or 0
                     src_mid = t.get("src_msg_id") or 0
+                    logger.info(f"Export uid={uid}: task {t.get('task_id','?')} ct={t['content_type']} src={src_cid}/{src_mid}")
                     if src_cid and src_mid and export_user_client:
                         try:
                             src_msg = await asyncio.wait_for(
@@ -1071,9 +1072,11 @@ async def export_user_config(uid: int) -> dict:
                             fresh_fid = _extract_media_file_id(src_msg, t["content_type"])
                             if fresh_fid:
                                 download_fid = fresh_fid
-                                logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: refreshed file_id from src msg {src_cid}/{src_mid}")
+                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed OK from src {src_cid}/{src_mid}")
+                            else:
+                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: src msg found but no {t['content_type']} media — using stored fid (may be stale)")
                         except Exception as ref_err:
-                            logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: could not prefetch src msg ({ref_err}), using stored file_id")
+                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: src msg prefetch FAILED ({ref_err}) — using stored fid (may trigger FILE_REFERENCE_EXPIRED)")
 
                     raw = await _download_media_bytes(
                         download_fid, user_client=export_user_client
@@ -1081,7 +1084,7 @@ async def export_user_config(uid: int) -> dict:
 
                     # Last-resort: if fresh-fid download also failed, try the raw stored fid
                     if raw is None and download_fid != t["file_id"]:
-                        logger.debug(f"Export uid={uid}: task {t.get('task_id','?')}: fresh fid failed, retrying with stored fid")
+                        logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: fresh fid download failed, retrying with stored fid")
                         raw = await _download_media_bytes(
                             t["file_id"], user_client=export_user_client
                         )
@@ -3336,6 +3339,7 @@ async def _run_job(tid: str):
             if ct not in ("text", "poll") and fid:
                 _src_cid = int(fresh.get("src_chat_id") or 0)
                 _src_mid = int(fresh.get("src_msg_id") or 0)
+                logger.info(f"Job {tid}: media send — ct={ct} src={_src_cid}/{_src_mid} fid={fid[:30] if fid else None}")
                 if _src_cid and _src_mid:
                     try:
                         _src_msg = await asyncio.wait_for(
@@ -3344,9 +3348,13 @@ async def _run_job(tid: str):
                         _fresh_fid = _extract_media_file_id(_src_msg, ct)
                         if _fresh_fid:
                             fid = _fresh_fid
-                            logger.debug(f"Job {tid}: file_id pre-refreshed from src {_src_cid}/{_src_mid}")
+                            logger.info(f"Job {tid}: file_id pre-refreshed OK from src {_src_cid}/{_src_mid}")
+                        else:
+                            logger.warning(f"Job {tid}: pre-refresh got message but no {ct} media in it — using stored fid")
                     except Exception as _fre:
-                        logger.debug(f"Job {tid}: could not pre-refresh file_id from src: {_fre}")
+                        logger.warning(f"Job {tid}: pre-refresh FAILED ({_fre}) — will use stored fid (likely to trigger FILE_REFERENCE_EXPIRED)")
+                else:
+                    logger.warning(f"Job {tid}: src_chat_id/src_msg_id not set — cannot pre-refresh, stored fid may be stale")
 
             async def _send():
                 nonlocal sent
