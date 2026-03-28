@@ -816,13 +816,19 @@ def _next_future_run(original_iso: str, interval_str: str | None,
 
 
 async def _download_media_bytes(file_id: str) -> bytes | None:
+    # FIX 19: wrap with timeout — Pyrogram retries upload.GetFile indefinitely on
+    # network stalls, blocking the export for minutes per file with no feedback.
     try:
-        buf = await app.download_media(file_id, in_memory=True)
+        buf = await asyncio.wait_for(
+            app.download_media(file_id, in_memory=True), timeout=45.0
+        )
         if buf:
             raw = bytes(buf.getbuffer())
             if len(raw) <= _MAX_MEDIA_EMBED_BYTES:
                 return raw
             logger.warning(f"Media {file_id[:20]}… too large to embed ({len(raw)} bytes)")
+    except asyncio.TimeoutError:
+        logger.warning(f"Media {file_id[:20]}… download timed out after 45s — skipping")
     except Exception as e:
         logger.warning(f"Could not download media {file_id[:20]}…: {e}")
     return None
@@ -2399,8 +2405,13 @@ async def handle_import_file(c, m, uid):
     wait = await m.reply("⏳ Reading backup file…")
 
     try:
-        buf = await app.download_media(m.document, in_memory=True)
+        buf = await asyncio.wait_for(
+            app.download_media(m.document, in_memory=True), timeout=60.0
+        )
         data = json.loads(bytes(buf.getbuffer()))
+    except asyncio.TimeoutError:
+        await wait.edit_text("❌ Download timed out (60s). Please try again.")
+        return
     except Exception as e:
         await wait.edit_text(f"❌ Could not parse file: {e}")
         return
@@ -3122,7 +3133,11 @@ async def _run_job(tid: str):
                 media = None
                 if fid:
                     try:
-                        media = await app.download_media(fid, in_memory=True)
+                        media = await asyncio.wait_for(
+                            app.download_media(fid, in_memory=True), timeout=45.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Job {tid}: bot download timed out after 45s")
                     except Exception as dl_e:
                         logger.warning(f"Job {tid}: bot download failed: {dl_e}")
                 if media is None and fresh.get("src_chat_id") and fresh.get("src_msg_id"):
@@ -3132,8 +3147,12 @@ async def _run_job(tid: str):
                             from_chat_id=fresh["src_chat_id"],
                             message_ids=fresh["src_msg_id"]
                         )
-                        media = await app.download_media(media_msg, in_memory=True)
+                        media = await asyncio.wait_for(
+                            app.download_media(media_msg, in_memory=True), timeout=45.0
+                        )
                         await media_msg.delete()
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Job {tid}: src forward download timed out after 45s")
                     except Exception as fwd_e:
                         logger.warning(f"Job {tid}: src forward failed: {fwd_e}")
                 if media is None:
