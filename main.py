@@ -113,20 +113,34 @@ def encrypt_session(s: str) -> str:
         return _fernet.encrypt(s.encode()).decode()
     return s
 
-def decrypt_session(s: str) -> str:
+def decrypt_session(s: str) -> str | None:
     """
-    FIX 12: Catches InvalidToken (key rotation) explicitly and logs a clear
-    warning instead of returning garbage that causes auth failures downstream.
-    Falls back to the raw string so legacy unencrypted rows still work.
+    FIX 12 (updated FIX 20): Catches InvalidToken and distinguishes two cases:
+
+    • s starts with 'gAAA'  → it IS a Fernet token but the key has been rotated.
+      Returning the raw ciphertext to Pyrogram causes silent auth failures.
+      Return None so callers treat this as "no session" and prompt re-login.
+
+    • s does NOT start with 'gAAA' → legacy plaintext row saved before encryption
+      was enabled.  Return s as-is so the session still works (backward compat).
     """
     if _fernet is None:
         return s
     try:
         return _fernet.decrypt(s.encode()).decode()
     except InvalidToken:
-        logger.warning(
-            "decrypt_session: InvalidToken — possible ENCRYPTION_KEY rotation. "
-            "The stored session cannot be decrypted. The user will need to log in again."
+        if s.startswith("gAAA"):
+            # Confirmed Fernet ciphertext — key has been rotated, cannot recover.
+            logger.warning(
+                "decrypt_session: InvalidToken on Fernet ciphertext — "
+                "ENCRYPTION_KEY was rotated. Session is unrecoverable; "
+                "returning None to force re-login."
+            )
+            return None
+        # Doesn't look like Fernet — treat as legacy plaintext session.
+        logger.info(
+            "decrypt_session: InvalidToken but value is not Fernet ciphertext — "
+            "treating as legacy plaintext session."
         )
         return s
     except Exception:
@@ -2404,16 +2418,39 @@ async def handle_import_file(c, m, uid):
 
     wait = await m.reply("⏳ Reading backup file…")
 
-    try:
-        buf = await asyncio.wait_for(
-            app.download_media(m.document, in_memory=True), timeout=60.0
+    # FIX 21: retry the download up to 3 times on connection resets or timeouts.
+    # A ConnectionResetError at the TCP layer causes download_media to hang until
+    # our timeout fires — retrying after a short pause recovers cleanly.
+    data = None
+    last_err = None
+    for _attempt in range(1, 4):
+        try:
+            buf = await asyncio.wait_for(
+                app.download_media(m.document, in_memory=True), timeout=60.0
+            )
+            data = json.loads(bytes(buf.getbuffer()))
+            break
+        except asyncio.TimeoutError:
+            last_err = "download timed out after 60s"
+            logger.warning(f"Import file download attempt {_attempt}/3 timed out for uid={uid}")
+        except Exception as e:
+            last_err = str(e)
+            logger.warning(f"Import file download attempt {_attempt}/3 failed for uid={uid}: {e}")
+        if _attempt < 3:
+            try:
+                await wait.edit_text(
+                    f"⚠️ Download failed (attempt {_attempt}/3), retrying in 5s…"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(5)
+
+    if data is None:
+        await wait.edit_text(
+            f"❌ **Could not download the backup file after 3 attempts.**\n\n"
+            f"Last error: `{last_err}`\n\n"
+            "Please wait a moment and try sending the file again."
         )
-        data = json.loads(bytes(buf.getbuffer()))
-    except asyncio.TimeoutError:
-        await wait.edit_text("❌ Download timed out (60s). Please try again.")
-        return
-    except Exception as e:
-        await wait.edit_text(f"❌ Could not parse file: {e}")
         return
 
     tasks_count    = len(data.get("tasks", []))
