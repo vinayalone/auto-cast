@@ -2418,38 +2418,79 @@ async def handle_import_file(c, m, uid):
 
     wait = await m.reply("⏳ Reading backup file…")
 
-    # FIX 21: retry the download up to 3 times on connection resets or timeouts.
-    # A ConnectionResetError at the TCP layer causes download_media to hang until
-    # our timeout fires — retrying after a short pause recovers cleanly.
-    data = None
+    # FIX 22: use the user's own Telegram session to download the backup file
+    # instead of the bot's main connection.
+    #
+    # Root cause of the repeated timeouts: the bot's main `app` connection shares
+    # a single TCP pipe with all the concurrent userbot job clients that fire on
+    # startup.  Those clients flood the connection with upload.GetFile retries,
+    # starving the bot's own download and causing consistent 60s timeouts.
+    #
+    # The user's session runs on its own independent connection (often a different
+    # DC) and is not affected by the job client congestion.  We pass the file_id
+    # directly so no peer resolution is needed.
+    #
+    # Strategy:
+    #   1. If user has a session → download via user client (fast, isolated).
+    #   2. Fall back to bot client with up to 5 attempts and exponential backoff.
+    file_id  = m.document.file_id
+    data     = None
     last_err = None
-    for _attempt in range(1, 4):
+
+    session = await get_session(uid)
+    if session:
         try:
-            buf = await asyncio.wait_for(
-                app.download_media(m.document, in_memory=True), timeout=60.0
-            )
-            data = json.loads(bytes(buf.getbuffer()))
-            break
+            async with Client(
+                ":memory:", api_id=API_ID, api_hash=API_HASH,
+                session_string=session,
+                device_model="AutoCast", system_version="Railway", app_version="2.0"
+            ) as _uc:
+                buf = await asyncio.wait_for(
+                    _uc.download_media(file_id, in_memory=True), timeout=90.0
+                )
+                if buf:
+                    data = json.loads(bytes(buf.getbuffer()))
+                    logger.info(f"Import file downloaded via user session uid={uid}")
         except asyncio.TimeoutError:
-            last_err = "download timed out after 60s"
-            logger.warning(f"Import file download attempt {_attempt}/3 timed out for uid={uid}")
+            last_err = "user-session download timed out after 90s"
+            logger.warning(f"Import: user-session download timed out uid={uid}")
         except Exception as e:
             last_err = str(e)
-            logger.warning(f"Import file download attempt {_attempt}/3 failed for uid={uid}: {e}")
-        if _attempt < 3:
+            logger.warning(f"Import: user-session download failed uid={uid}: {e}")
+
+    # Fallback: bot client with exponential backoff (5 attempts: 0s, 5s, 10s, 20s, 40s)
+    if data is None:
+        for _attempt in range(1, 6):
+            delay = 0 if _attempt == 1 else 5 * (2 ** (_attempt - 2))  # 0,5,10,20,40
+            if delay:
+                try:
+                    await wait.edit_text(
+                        f"⚠️ Download attempt {_attempt}/5 failed — retrying in {delay}s…\n"
+                        f"`{last_err}`"
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(delay)
             try:
-                await wait.edit_text(
-                    f"⚠️ Download failed (attempt {_attempt}/3), retrying in 5s…"
+                buf = await asyncio.wait_for(
+                    app.download_media(file_id, in_memory=True), timeout=90.0
                 )
-            except Exception:
-                pass
-            await asyncio.sleep(5)
+                if buf:
+                    data = json.loads(bytes(buf.getbuffer()))
+                    logger.info(f"Import file downloaded via bot client attempt {_attempt} uid={uid}")
+                    break
+            except asyncio.TimeoutError:
+                last_err = f"bot download timed out after 90s (attempt {_attempt})"
+                logger.warning(f"Import: bot download attempt {_attempt}/5 timed out uid={uid}")
+            except Exception as e:
+                last_err = str(e)
+                logger.warning(f"Import: bot download attempt {_attempt}/5 failed uid={uid}: {e}")
 
     if data is None:
         await wait.edit_text(
-            f"❌ **Could not download the backup file after 3 attempts.**\n\n"
+            f"❌ **Could not download the backup file.**\n\n"
             f"Last error: `{last_err}`\n\n"
-            "Please wait a moment and try sending the file again."
+            "The server is under heavy load. Please wait 1–2 minutes and send the file again."
         )
         return
 
