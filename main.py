@@ -960,16 +960,19 @@ async def _upload_media_bytes(user_client, ct: str,
         else:
             sent = await user_client.send_document(target, buf, caption=caption or "")
             fid  = sent.document.file_id
+        # ── FIX 27: Do NOT delete the staging message ─────────────────────────
+        # Previously we deleted it immediately after getting file_id.  That made
+        # src_msg_id point to a deleted (empty) message, so all future attempts to
+        # refresh the file reference via get_messages(src_chat_id, src_msg_id)
+        # returned a ghost record with no media — causing FILE_REFERENCE_EXPIRED
+        # on every job run and every export.
+        # Keeping the message in Saved Messages means the file reference can always
+        # be refreshed cheaply with a single get_messages() call.
+        logger.debug(f"_upload_media_bytes ct={ct}: staging msg {sent.id} kept in Saved Messages for reference refresh")
         return fid
     except Exception as e:
         logger.warning(f"_upload_media_bytes ct={ct}: {e}")
         return None
-    finally:
-        if sent:
-            try:
-                await sent.delete()
-            except Exception:
-                pass
 
 
 async def export_user_config(uid: int) -> dict:
@@ -1062,7 +1065,10 @@ async def export_user_config(uid: int) -> dict:
                     # of Pyrogram reconnects that FILE_REFERENCE_EXPIRED triggers.
                     src_cid = t.get("src_chat_id") or 0
                     src_mid = t.get("src_msg_id") or 0
-                    logger.info(f"Export uid={uid}: task {t.get('task_id','?')} ct={t['content_type']} src={src_cid}/{src_mid}")
+                    last_mid = int(t.get("last_msg_id") or 0)
+                    logger.info(f"Export uid={uid}: task {t.get('task_id','?')} ct={t['content_type']} src={src_cid}/{src_mid} last_msg={last_mid}")
+
+                    # ── Tier A: staging message in Saved Messages ─────────────────────
                     if src_cid and src_mid and export_user_client:
                         try:
                             src_msg = await asyncio.wait_for(
@@ -1072,19 +1078,37 @@ async def export_user_config(uid: int) -> dict:
                             fresh_fid = _extract_media_file_id(src_msg, t["content_type"])
                             if fresh_fid:
                                 download_fid = fresh_fid
-                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed OK from src {src_cid}/{src_mid}")
+                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed OK from Saved Messages msg {src_mid}")
                             else:
-                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: src msg found but no {t['content_type']} media — using stored fid (may be stale)")
+                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: Saved Messages msg {src_mid} has no {t['content_type']} (deleted before FIX 27) — trying last_msg fallback")
                         except Exception as ref_err:
-                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: src msg prefetch FAILED ({ref_err}) — using stored fid (may trigger FILE_REFERENCE_EXPIRED)")
+                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: Saved Messages fetch FAILED ({ref_err}) — trying last_msg fallback")
+
+                    # ── Tier B: last sent message in target channel ───────────────────
+                    # For tasks created before FIX 27 (staging msg was deleted), fetch
+                    # from the last successfully sent message in the channel instead.
+                    if download_fid == t["file_id"] and last_mid and export_user_client:
+                        try:
+                            last_msg = await asyncio.wait_for(
+                                export_user_client.get_messages(int(t["chat_id"]), last_mid),
+                                timeout=15.0,
+                            )
+                            last_fid = _extract_media_file_id(last_msg, t["content_type"])
+                            if last_fid:
+                                download_fid = last_fid
+                                logger.info(f"Export uid={uid}: task {t.get('task_id','?')}: file_id refreshed from last sent msg {last_mid} in channel")
+                            else:
+                                logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: last sent msg {last_mid} has no {t['content_type']} — falling back to stored fid")
+                        except Exception as lme:
+                            logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: last_msg fetch FAILED ({lme}) — using stored fid")
 
                     raw = await _download_media_bytes(
                         download_fid, user_client=export_user_client
                     )
 
-                    # Last-resort: if fresh-fid download also failed, try the raw stored fid
+                    # Last-resort: if refreshed fid still failed, try raw stored fid
                     if raw is None and download_fid != t["file_id"]:
-                        logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: fresh fid download failed, retrying with stored fid")
+                        logger.warning(f"Export uid={uid}: task {t.get('task_id','?')}: refreshed fid download failed, retrying with stored fid")
                         raw = await _download_media_bytes(
                             t["file_id"], user_client=export_user_client
                         )
@@ -3340,6 +3364,8 @@ async def _run_job(tid: str):
                 _src_cid = int(fresh.get("src_chat_id") or 0)
                 _src_mid = int(fresh.get("src_msg_id") or 0)
                 logger.info(f"Job {tid}: media send — ct={ct} src={_src_cid}/{_src_mid} fid={fid[:30] if fid else None}")
+
+                # ── Tier A: staging message in Saved Messages (FIX 27 keeps it alive) ──
                 if _src_cid and _src_mid:
                     try:
                         _src_msg = await asyncio.wait_for(
@@ -3348,13 +3374,33 @@ async def _run_job(tid: str):
                         _fresh_fid = _extract_media_file_id(_src_msg, ct)
                         if _fresh_fid:
                             fid = _fresh_fid
-                            logger.info(f"Job {tid}: file_id pre-refreshed OK from src {_src_cid}/{_src_mid}")
+                            logger.info(f"Job {tid}: file_id pre-refreshed OK from Saved Messages msg {_src_mid}")
                         else:
-                            logger.warning(f"Job {tid}: pre-refresh got message but no {ct} media in it — using stored fid")
+                            logger.warning(f"Job {tid}: Saved Messages msg {_src_mid} has no {ct} (was deleted before FIX 27) — trying last_msg fallback")
                     except Exception as _fre:
-                        logger.warning(f"Job {tid}: pre-refresh FAILED ({_fre}) — will use stored fid (likely to trigger FILE_REFERENCE_EXPIRED)")
-                else:
-                    logger.warning(f"Job {tid}: src_chat_id/src_msg_id not set — cannot pre-refresh, stored fid may be stale")
+                        logger.warning(f"Job {tid}: Saved Messages fetch failed ({_fre}) — trying last_msg fallback")
+
+                # ── Tier B: last sent message in target channel (fallback for old tasks) ──
+                # For tasks created before FIX 27, the staging msg was deleted.
+                # The last successfully sent message in the channel still has the media
+                # with a fresh file reference — use it to refresh.
+                if fid == fresh["file_id"]:    # still on stale fid after tier A
+                    _last_mid = int(fresh.get("last_msg_id") or 0)
+                    if _last_mid:
+                        try:
+                            _last_msg = await asyncio.wait_for(
+                                user.get_messages(target_int, _last_mid), timeout=15.0
+                            )
+                            _last_fid = _extract_media_file_id(_last_msg, ct)
+                            if _last_fid:
+                                fid = _last_fid
+                                logger.info(f"Job {tid}: file_id refreshed from last sent msg {_last_mid} in channel")
+                            else:
+                                logger.warning(f"Job {tid}: last sent msg {_last_mid} has no {ct} — stored fid will be used (may expire)")
+                        except Exception as _lfe:
+                            logger.warning(f"Job {tid}: last_msg fetch failed ({_lfe}) — stored fid will be used")
+                    else:
+                        logger.warning(f"Job {tid}: no last_msg_id and no valid src msg — stored fid may be stale")
 
             async def _send():
                 nonlocal sent
